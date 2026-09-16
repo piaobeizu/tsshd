@@ -1,0 +1,63 @@
+{
+  "case": "bottleneck_upclean",
+  "netem": {
+    "name": "bottleneck_upclean",
+    "shared": false,
+    "delay_up_ms": 50,
+    "delay_down_ms": 50,
+    "loss_up": 0.2,
+    "loss_down": 0.2,
+    "rate_up_bps": 0,
+    "rate_down_bps": 250000,
+    "limit_up_pkts": 1000,
+    "limit_down_pkts": 1000,
+    "seed": 20260916
+  },
+  "expect": "ok",
+  "ok": true,
+  "child_mode": "flood",
+  "paste_kb": 0,
+  "warmup_sec": 5,
+  "drain_bps": 0,
+  "t_inject_ns": 2378543998024683,
+  "t_pipe_write_done_ns": 2378543998074006,
+  "t_sigint_ns": 2378544048696764,
+  "t_lastwrite_ns": 2378546519113234,
+  "t_child_marker_ns": 2378546519191393,
+  "t_client_marker_ns": 2378547228747291,
+  "ctrl_path_ms": 50.672081,
+  "pipe_write_ms": 0.049323,
+  "child_react_ms": 2470.41647,
+  "marker_travel_ms": 709.555898,
+  "perceived_total_ms": 3230.722608,
+  "child_wrote_bytes": 555582,
+  "client_bytes_at_marker": 545564,
+  "client_bytes_total": 545564,
+  "discard_warnings": 0,
+  "relay": {
+    "up": {
+      "enqueued": 1444,
+      "egressed": 1444,
+      "dropped_loss": 368,
+      "dropped_queue_full": 0,
+      "enqueued_bytes": 126593,
+      "egressed_bytes": 126593,
+      "dropped_bytes": 32879,
+      "max_qlen_packets": 29,
+      "max_qlen_bytes": 1740
+    },
+    "down": {
+      "enqueued": 2005,
+      "egressed": 2005,
+      "dropped_loss": 786,
+      "dropped_queue_full": 1092,
+      "enqueued_bytes": 2060220,
+      "egressed_bytes": 2060220,
+      "dropped_bytes": 2135742,
+      "max_qlen_packets": 1000,
+      "max_qlen_bytes": 1060351
+    }
+  },
+  "qlen_up_pkts_at_inject": 10,
+  "qlen_down_pkts_at_inject": 632
+}
