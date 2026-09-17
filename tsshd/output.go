@@ -43,6 +43,13 @@ type clientOutputForwarder struct {
 	cacheBuf     []byte
 	discardLines uint64
 	discardBytes uint64
+
+	// done is closed when forward returns, i.e. the output stream has ended
+	// and every byte read from it has been handed to the caller through the
+	// session pipe. The detach rendezvous (SshUdpClient.notifyServerDetach)
+	// waits on it before closing the transport, so no already-received
+	// output can be discarded unread.
+	done chan struct{}
 }
 
 func (f *clientOutputForwarder) forward() {
@@ -51,6 +58,7 @@ func (f *clientOutputForwarder) forward() {
 		if !f.client.detached.Load() {
 			_ = f.reader.CloseRead()
 		}
+		close(f.done)
 	}()
 
 	buffer := make([]byte, 32*1024)
@@ -119,6 +127,21 @@ func (f *clientOutputForwarder) forward() {
 		}
 	}
 	f.client.debug("session [%d] %s completed", f.sess.id, f.name)
+}
+
+// waitDone blocks until the forwarder has completed (see done) or the
+// timeout elapses. A nil forwarder - no output pipe was requested - is
+// trivially done.
+func (f *clientOutputForwarder) waitDone(timeout time.Duration) bool {
+	if f == nil {
+		return true
+	}
+	select {
+	case <-f.done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 type serverOutputForwarder struct {

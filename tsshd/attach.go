@@ -159,14 +159,18 @@ func (s *replaceableStream) do(fn func(Stream) error) error {
 		cur := s.stream
 		s.mu.Unlock()
 
-		// do executes operation on the active stream and retries if the stream is replaced
+		// do executes operation on the active stream and retries if the stream was replaced
+		// AND the attempt failed: an attempt that succeeded has delivered its bytes to the
+		// stream it ran on, and re-running it on the replacement would duplicate them. A
+		// write racing the swap therefore ends up on exactly one stream - the old one if it
+		// completed, the replacement if the old stream's close made it fail.
 		err := fn(cur)
 
 		s.mu.Lock()
 		switched := s.stream != cur
 		s.mu.Unlock()
 
-		if switched {
+		if switched && err != nil {
 			continue
 		}
 

@@ -179,6 +179,12 @@ type quitMessage struct {
 	Msg string `json:",omitempty"`
 }
 
+// detachAckMessage is the server's reply to the client's "detach" bus
+// command. It carries no fields today; the acknowledgement itself is the
+// signal that the server has detached the sessions the client owned (see
+// handleDetachEvent in bus.go).
+type detachAckMessage struct{}
+
 type aliveMessage struct {
 	Time int64 `json:",omitempty"`
 }

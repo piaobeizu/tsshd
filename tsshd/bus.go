@@ -164,6 +164,8 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 			err = s.handleSettingEvent(stream)
 		case "rekey":
 			err = s.handleRekeyEvent(stream)
+		case "detach": // graceful client detach; sessions keep running
+			s.handleDetachEvent()
 		default:
 			if err := handleUnknownEvent(stream, command); err != nil {
 				warning("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
@@ -172,6 +174,43 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		if err != nil {
 			warning("handle bus command [%s] failed: %v", command, err)
 		}
+	}
+}
+
+// handleDetachEvent processes a graceful client detach: the client is
+// leaving, but its sessions keep running in the background. Detach the
+// sessions this server owns immediately - the same per-session teardown a
+// successor client triggers at activation - so the session's client
+// checker reports "no client" (engaging the pending-output cache) and
+// the session output streams are swapped out (ending them) instead of
+// staying connected to a transport nobody will read again. Output written
+// from this point on is cached for the next attaching client rather than
+// silently dying in the old transport's send path.
+//
+// The acknowledgement is sent only after the detach has been processed:
+// by stream ordering the client receives it after every byte already
+// forwarded to it, and the ended session streams carry their data before
+// their FIN, so a client that drains its session output to EOF before
+// closing the transport has received everything that was sent to it.
+func (s *sshUdpServer) handleDetachEvent() {
+	// Serialize with session attach and server activation, the same way
+	// activateServer does: detachAllSessions is called with attachMutex held.
+	attachMutex.Lock()
+	// Gate on the transport for the same reason the client gates its side:
+	// closing the old session streams must be a graceful end that follows
+	// the data already written (smux over KCP). QUIC's stream Close cancels
+	// the write side and discards buffered in-flight output, so over QUIC
+	// the immediate teardown would discard data the detaching client has
+	// not received yet; there the session keeps the previous behavior and
+	// only the acknowledgement is sent. A client that (against its own
+	// gate) sent detach over QUIC then falls back after its bounded waits.
+	if s.args.KCP && activeSshUdpServer.Load() == s {
+		s.detachAllSessions(s)
+	}
+	attachMutex.Unlock()
+
+	if err := s.sendBusMessage("detachAck", &detachAckMessage{}); err != nil {
+		warning("send detach ack failed: %v", err)
 	}
 }
 
