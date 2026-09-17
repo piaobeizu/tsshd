@@ -35,7 +35,11 @@ import (
 
 const kTsshdVersion = "0.1.9"
 
-const kTsshdProtocol = 1
+// kTsshdProtocol is the wire protocol version advertised in the bus hello.
+// Protocol 2 adds the graceful-detach rendezvous: the client may send the
+// "detach" bus command, the server engages its pending-output cache for the
+// sessions the detaching client owns before replying "detachAck".
+const kTsshdProtocol = 2
 
 // buildTag stores the version tag injected at build time via -ldflags.
 var buildTag = ""

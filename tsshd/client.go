@@ -63,6 +63,7 @@ type SshUdpClient struct {
 	proxyClient      *SshUdpClient
 	protoClient      protocolClient
 	protoVersion     int
+	udpMode          string // kUdpModeKCP / kUdpModeQUIC: the terminal-hop server's transport
 	clientProxy      *clientProxy
 	intervalTime     time.Duration
 	connectTimeout   time.Duration
@@ -73,6 +74,7 @@ type SshUdpClient struct {
 	busMutex         sync.Mutex
 	busStream        Stream
 	busClosed        chan struct{}
+	detachAckChan    chan struct{} // signalled by handleDetachAckEvent; see notifyServerDetach
 	sessionMutex     sync.Mutex
 	sessionID        atomic.Uint64
 	sessionMap       map[uint64]*SshUdpSession
@@ -134,6 +136,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	udpClient = &SshUdpClient{
 		proxyClient:     opts.ProxyClient,
 		protoVersion:    min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
+		udpMode:         opts.ServerInfo.Mode,
 		sessionMap:      make(map[uint64]*SshUdpSession),
 		channelMap:      make(map[string]chan ssh.NewChannel),
 		intervalTime:    opts.IntervalTime,
@@ -320,11 +323,127 @@ func (c *SshUdpClient) Close() (err error) {
 //
 // After Detach returns, subsequent calls to Close are safe and will NOT
 // terminate or interfere with the remote session.
+//
+// On servers that advertise protocol 2 or newer, Detach first performs a
+// rendezvous (notifyServerDetach): the server is asked to detach the sessions
+// this client owns - engaging its pending-output cache immediately - and the
+// transport stays open until the server acknowledges and this client's session
+// output has drained to EOF. Every output byte the server forwarded before
+// processing the notice is therefore received by this client, and every byte
+// written after is preserved by the server for the next attaching client,
+// instead of silently dying in this transport's send path.
 func (c *SshUdpClient) Detach() {
 	if !c.detached.CompareAndSwap(false, true) {
 		return
 	}
+	c.notifyServerDetach()
 	_ = c.Close()
+}
+
+// Bounds for the detach rendezvous. They only apply on the rendezvous path;
+// a server that never acknowledges (older server, or the link died) falls
+// back to the previous immediate behavior after the bound instead of
+// blocking indefinitely.
+const (
+	kDetachAckTimeout   = 3 * time.Second
+	kDetachDrainTimeout = 3 * time.Second
+)
+
+// notifyServerDetach performs the graceful-detach rendezvous with the
+// server: it sends the "detach" bus command, waits (bounded) for the
+// acknowledgement that the server has detached the sessions this client
+// owns - which engages the server's pending-output cache immediately and
+// ends the session output streams - and then waits (bounded) for this
+// client's session output to drain to EOF.
+//
+// The rendezvous is gated on the negotiated protocol version: servers that
+// predate protocol 2 never acknowledge the notice, so against them Detach
+// keeps the previous immediate behavior rather than stalling on the
+// acknowledgement bound. On any failure (send error, acknowledgement or
+// drain timeout) the function simply returns and Detach proceeds exactly
+// as before this rendezvous existed.
+func (c *SshUdpClient) notifyServerDetach() {
+	if c.protoVersion < 2 {
+		return
+	}
+	// The rendezvous's byte-exactness argument relies on the transport's
+	// stream close being a graceful FIN that follows the data already
+	// written (smux over KCP: the FIN is an ordered frame on the stream, the
+	// data before it is delivered). QUIC's stream Close cancels the write
+	// side and discards buffered in-flight output (quicStream.Close), so the
+	// same argument does not hold there. A QUIC-safe graceful teardown is
+	// follow-up work; over QUIC Detach keeps the previous behavior.
+	if c.udpMode != kUdpModeKCP {
+		return
+	}
+	c.busMutex.Lock()
+	if c.busStream == nil {
+		c.busMutex.Unlock()
+		return
+	}
+	ack := make(chan struct{})
+	c.detachAckChan = ack
+	// Send directly: sendBusCommand/sendBusMessage return early once the
+	// detached flag is set, and Detach sets it before calling here. The
+	// send is bounded: a wedged transport must not hold Detach forever
+	// before it can reach the bounded waits below. The abandoned writer
+	// goroutine dies with the process - the same trade the bounded bus
+	// "quit" send in activateServer makes.
+	_, err := doWithTimeout(func() (int, error) {
+		return 0, sendCommand(c.busStream, "detach")
+	}, kDetachAckTimeout)
+	c.busMutex.Unlock()
+	if err != nil {
+		c.debug("send cmd [detach] failed: %v", err)
+		return
+	}
+
+	select {
+	case <-ack:
+		c.debug("detach acknowledged by server")
+	case <-time.After(kDetachAckTimeout):
+		c.debug("detach acknowledgement timeout")
+		return
+	}
+
+	// The server has ended the session output streams; wait for the local
+	// session output forwarders to finish handing their bytes to the caller
+	// through the session pipes (or for the bound), so closing the transport
+	// cannot discard received-but-undelivered output. A caller that stopped
+	// reading its session pipes makes this hit the bound; the fallback is
+	// the previous immediate close.
+	//
+	// Contract: the caller does not start sessions concurrently with Detach
+	// (tssh calls Detach from its exit path). Forwarders created after this
+	// snapshot - a session started mid-rendezvous - are outside the
+	// rendezvous's reach and keep the previous behavior at Close.
+	c.sessionMutex.Lock()
+	sessions := make([]*SshUdpSession, 0, len(c.sessionMap))
+	for _, sess := range c.sessionMap {
+		sessions = append(sessions, sess)
+	}
+	c.sessionMutex.Unlock()
+	deadline := time.Now().Add(kDetachDrainTimeout)
+	for _, sess := range sessions {
+		if !sess.waitOutputDrained(time.Until(deadline)) {
+			c.debug("session output did not drain to EOF before the detach bound")
+			return
+		}
+	}
+}
+
+// waitOutputDrained blocks until the session's output forwarders have
+// completed - the output streams have ended and every byte read from them
+// has been handed to the caller through the session pipes - or until the
+// timeout. Returns false on timeout.
+func (s *SshUdpSession) waitOutputDrained(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for _, forwarder := range []*clientOutputForwarder{s.outForwarder, s.errForwarder} {
+		if !forwarder.waitDone(time.Until(deadline)) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
@@ -758,12 +877,30 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.handleDiscardEvent()
 		case "rekey":
 			c.handleRekeyEvent()
+		case "detachAck":
+			c.handleDetachAckEvent()
 		default:
 			if err := handleUnknownEvent(c.busStream, command); err != nil {
 				c.warning("handle bus command [%s] failed: %v. You may need to upgrade tssh.", command, err)
 			}
 		}
 	}
+}
+
+// handleDetachAckEvent consumes the server's acknowledgement of the
+// client's "detach" notice and wakes the Detach call waiting on it.
+func (c *SshUdpClient) handleDetachAckEvent() {
+	var ack detachAckMessage
+	if err := recvMessage(c.busStream, &ack); err != nil {
+		c.warning("recv detach ack message failed: %v", err)
+		return
+	}
+	c.busMutex.Lock()
+	if c.detachAckChan != nil {
+		close(c.detachAckChan)
+		c.detachAckChan = nil
+	}
+	c.busMutex.Unlock()
 }
 
 func (c *SshUdpClient) handleQuitEvent() {
@@ -1113,6 +1250,7 @@ func (s *SshUdpSession) newOutputForwarder(name string, reader Stream, writer *i
 		client: s.client,
 		reader: reader,
 		writer: writer,
+		done:   make(chan struct{}),
 	}
 }
 
