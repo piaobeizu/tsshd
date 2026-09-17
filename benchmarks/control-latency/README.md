@@ -66,16 +66,108 @@ traverse the transport under test.
 | `paste_shared_reading` | shared bottleneck | flood **+ reads stdin** | 64 KB | agent model: paste-then-Ctrl-C |
 | `paste_block` | shared bottleneck | flood, never reads stdin | 64 KB | pathological paste target |
 | `paste_baseline` | clean link | flood, never reads stdin | 64 KB | PTY input-buffer HOL with no network |
+| `input_*` (8) | as the base case | floodcount/ctrlcount ×30 (`floodreadcount` + echo off for the paste case) | 64 KB per sample for `input_paste_shared_reading` | row-1 gate suites: ≥30 sequential interrupts against a surviving child |
+| `bulk_clean`, `bulk_clean_cap200` | 100 Mbps / 200 Mbps cap | bulk ×12 s (echo off, reads stdin) | — | row-5 goodput, both directions |
+| `bulk_bottleneck_shared`, `bulk_bottleneck_split` | 2 Mbps + 20% + flood | bulk ×12 s | — | row-5 degraded goodput, both directions |
+| `reconnect_roam` | 2 Mbps + 20% loss | roam ×15 s (raw output) | — | row-7 black-hole reconnect under load |
+| `reconnect_attach` | 2 Mbps + 20% loss | roam ×15 s (raw output) | — | row-7 detach + attach under load |
+| `integrity_clean`, `integrity_flood` | clean / +20% loss | integrity (1 MiB framed payload) | — | row-8 byte diff vs server PTY reference |
 
-`TSSHD_CTRL_BENCH_OUT=<file>` writes the full measurement as JSON
-(one artifact per run is committed under `results/`).
+`TSSHD_CTRL_BENCH_OUT=<file>` writes a schema-2 suite containing all
+seeded runs (three by default) as JSON. Set `TSSHD_CTRL_BENCH_RUNS=1` only
+for harness development; a citable gate artifact always contains 3/3 runs.
 
 ```sh
-# one case per process:
+# one case, three seeded runs, one reproducible suite artifact:
 TSSHD_CTRL_BENCH=bottleneck_shared \
-TSSHD_CTRL_BENCH_OUT=/tmp/shared.json \
-go test ./tsshd -run TestControlLatencyUnderFlood -v -count=1
+TSSHD_CTRL_BENCH_OUT="$PWD/benchmarks/control-latency/results/my-shared-suite.json" \
+go test ./tsshd -run '^TestControlLatencyUnderFlood$' -v -count=1
+# raise go test's own 10m default for slow suites, e.g. the paste case:
+# go test ./tsshd -run '^TestControlLatencyUnderFlood$' -count=1 -timeout=2h
 ```
+
+## Budget-gate harness
+
+The gate inventory is executable and machine-readable. This command emits the
+contract, activation state, threshold and baseline provenance for any case:
+
+```sh
+TSSHD_CTRL_GATE=all go test ./tsshd -run '^TestControlBudgetGateCatalog$' -v -count=1
+```
+
+Every measurement uses the same `TSSHD_CTRL_BENCH=<case>` command shown above.
+The RNG seed (`20260916`), run count and every run are embedded in the suite;
+timestamps use `CLOCK_MONOTONIC`. `results/budget-baselines.json` is the
+baseline index. It distinguishes `[committed]`, `[README-reported]` and
+`[design-target]` figures and names the source artifact for each committed
+number.
+
+| budget | active cases | statistic / behavior |
+|---|---|---|
+| row 1 input delivery | `input_baseline`, `loss20`, `input_loss20_flood`, `input_slow_client`, `input_bottleneck_upclean`, `input_bottleneck_split`, `input_bottleneck_shared`, `input_paste_shared_reading` | 30 sequential interrupts against a surviving child per run; nearest-rank p95; committed value +10% |
+| row 2 drain confirmation | `input_bottleneck_shared`, `input_bottleneck_split` | per-sample `T_client_marker-T_inject`, nearest-rank p95; P1-off baseline only |
+| row 5 bulk goodput | `bulk_clean`, `bulk_clean_cap200`, `bulk_bottleneck_shared`, `bulk_bottleneck_split` | client receive byte samples in `[5s,10s] / 5s`, **each direction in every case**: downlink from client byte samples, uplink from child-received bytes at the same window (child disables PTY echo so the two directions stay separable; no echo feedback storm). The uplink is line-discipline-bound (~4 KB per canonical line per round trip), not transport-bound — the figure measures a canonical-PTY session uplink. Missing child uplink reports fail the run. |
+| row 6 amplification | the four bulk cases + the one-way `baseline` case | `relay.aggregate.egressed_bytes/client_payload`; offered ratio alongside; shared-mode aggregate counted once. The one-way clean reference (`baseline`, ≤2.8× vs committed 2.679×) is gated; the bidirectional bulk family reports [committed-v2] baselines (echo off changes the denominator; the legacy one-way figure is context, not a directly comparable gate). |
+| row 7 reconnect | `reconnect_roam`, `reconnect_attach` | mid-transfer black-hole reconnect and real detach/new-client attach; reattach time plus byte continuity under the unchanged pending-output policy. Roam: **exact equality** required (child total == client total; the child disables PTY OPOST so the count is bytewise-decidable; a missing child total or any unaccounted gap fails the run). Attach: success + attach time required, and the continuity gap is **gated at the committed maximum +10%** (30720 B) — measured 3/3: the detach-window records (~30 x 1024 B) reach neither client with zero discard notices, an un-accounted loss recorded in `continuity_gap_bytes`/`continuity_unaccounted` and in the baselines index; the production defect is tracked by tsshd#11, and exact equality is this case's target once it lands |
+| row 8 integrity | `integrity_clean`, `integrity_flood` | exact framed 1 MiB PTY payload comparison against a server-side PTY reference (`screenBuf` tap, captured before stream forwarding), byte diff must be zero |
+
+Feature-dependent contracts are present but deliberately **inactive**:
+`visible-confirmation-ack-split` / `visible-confirmation-ack-shared` wait for
+tsshd#7 (and the split fast gate also waits for tsshd#6); `post-shed-settle`
+and `raw-pty-byte-integrity-shed` wait for tsshd#8. `TSSHD_CTRL_GATE` only
+reports these contracts—it cannot activate them. This prevents a placeholder
+or absent capability from producing a green gate.
+
+Shared-mode artifacts no longer mirror one queue into both directions. Each
+packet carries an up/down classification, while `relay.aggregate` is the one
+physical shared FIFO and is counted exactly once for amplification. In split
+mode the aggregate is the sum of both physical queues. A focused unit test
+pins this accounting.
+
+The suite is benchmark-only: no production code path reads either environment
+variable, and without them both tests skip, so normal `go test ./...` remains
+unchanged.
+
+**Baseline re-anchor, limitations and open gates.** The legacy single-shot
+artifacts were fixed-phase draws: their Ctrl-C was injected at one warmup
+instant whose queue occupancy is not reproducible, so they never sampled the
+pinned-full-queue tail. Harness-v2 30-sample suites measure that tail, so
+rows were re-anchored to [committed-v2] p95 envelopes per design §7 gate
+discipline (relaxed only with new committed evidence, recorded on the work
+item's timeline); `results/budget-baselines.json` carries the per-run
+evidence trail and the provenance of every figure. Committed 3/3 suites
+exist for every active row-1/2/5-8 case at the current pins. Known limits:
+
+* The clean 200-Mbps case caps the *relay*, not P1's future server output
+  pacer; it cannot close the P1-on comparison (owned by tsshd#6).
+* The paste case's per-sample patience is 120 s with a patience-censoring
+  protocol: kcp RTO backoff on the ordering-constrained paste segments
+  pushes single samples into a heavy, phase-correlated tail without the
+  input path being broken (the measured ladder: 90 s truncated 5 of 6
+  seeded runs, 300 s truncated 1 of 3, 600 s censored consecutive samples
+  in 2 of 4 runs). A stuck attempt is recorded as `censored` in the
+  artifact (CtrlMs = the bound, a lower bound) and KEPT in the p95 input
+  at that bound, so censored attempts sort above every completed sample:
+  one censor per run keeps the rank-29-of-30 p95 on a completed sample,
+  while the second makes the p95 itself censored and aborts the run red —
+  a red run always writes its artifact in bounded time (~5 min) instead of
+  burning hours. The censor count is itself the sharpest regression
+  signal: with output pacing (tsshd#6) the queue never pins and censors
+  vanish.
+* Degraded bulk runs are liveness-bounded on both sides: the child abandons
+  stdout writes blocked longer than 12 s + 120 s, and the client's uplink
+  writer is waited for at most 90 s. The goodput window comes from the
+  child's own reports, so a writer stalled behind a collapsed downlink is
+  abandoned with a log rather than failing the run — a run whose uplink
+  reports are actually missing fails the suite instead of silently
+  reporting one direction. The re-exec'd children also exit when their
+  harness process disappears (side-channel EOF or stdout write error),
+  so failed runs stop leaking spinning flood children.
+* Reconnect continuity is exact-bytewise in zero-discard runs (client total
+  == child total); the roam child disables PTY OPOST, otherwise ONLCR adds
+  one byte per record and equality is undecidable.
+* The integrity reference is captured from the server PTY's `screenBuf` tap,
+  before stream forwarding, and not inferred from client bytes.
 
 Roughly equivalent `tc netem` on a veth pair (for validating the real
 binaries; the in-process harness exists because cross-process timestamping
