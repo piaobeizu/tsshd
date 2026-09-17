@@ -186,6 +186,13 @@ agent flood), Ctrl-C typed with no pending paste:
 
 ### Follow-up candidates (out of scope here)
 
+These candidates are now evaluated, ranked and filed as phased, independently
+verifiable work items — see
+[docs/weak-network-agent-design.md](../../docs/weak-network-agent-design.md)
+(tsshd#2): output pacing (rank 1) → input-accepted bus ack (2) → opt-in
+client-requested backlog disposal (3) → qdisc/DSCP boundaries (4) →
+goodput attribution (5).
+
 * server output pacing / uplink-headroom reservation (tsshd)
 * a bus-stream "input ack" echo so the client can show that Ctrl-C was
   delivered while output is still draining (tsshd, one-way traffic on the
