@@ -921,6 +921,29 @@ type ctrlCase struct {
 	SampleTimeout     time.Duration // per-sample SIGINT patience in count modes (0 = 10 s)
 	ReconnectOutage   time.Duration // non-zero: black-hole relay mid-transfer, then restore
 	AttachAfterDetach bool          // detach first client and attach a second under load
+
+	// P1WireBPS configures the server's KCP downlink wire budget
+	// (--kcp-wire-rate, bytes/s; 0 = pacing off). P1-on case variants
+	// (the p1_* prefix) set it to the recipe: 0.7 x the case's bottleneck
+	// wire rate (175,000 B/s at the 2 Mbps reference), or the 200 Mbps
+	// clean cap (25,000,000 B/s) for the clean-link regression. Uncapped
+	// cases run the weak-link recipe so the pacer is the binding
+	// constraint even on a clean link.
+	P1WireBPS int64
+
+	// UplinkSourceBPS bounds the client's bulk uplink source rate (0 = the
+	// historical 800 KB/s firehose of the committed unpaced cases). The P1-on
+	// degraded variants bound it to ~3x the canonical-PTY line-discipline
+	// drain the harness itself measured (uplink delivered 0.3-0.8 KB/s in
+	// every committed bulk run): against a paced downlink the 800 KB/s source
+	// fabricates an uplink-side collapse - the client's kcp send queue
+	// absorbs ~2 MB and retransmits it into the shared queue for the whole
+	// run (measured 5.7-10.8 MB offered uplink for ~70 KB of payload, in both
+	// the paced and the committed unpaced runs). No real agent session
+	// pushes input faster than its PTY consumes; the row-5 pinned-formula
+	// gate tests the downlink recipe and requires the downlink to actually
+	// receive its budgeted share of the shared queue.
+	UplinkSourceBPS int64
 }
 
 // ctrlExpect is the anticipated outcome of a case; it turns documented
@@ -1200,6 +1223,83 @@ func init() {
 		c.WaitTimeout = 180 * time.Second
 		return c
 	}
+	// Matched-stimulus P1-off references for the row-5 controlled comparison
+	// (review finding: the p1 bulk variants bound the uplink source, so the
+	// P1-off side needs the same stimulus to attribute the difference to the
+	// pacer rather than to the workload). These run the degraded bulk cases
+	// with the SAME 8 KB/s bounded uplink and pacing OFF; the row-5 gate
+	// still binds to the tsshd#3-measured baselines (original stimulus) per
+	// the wi's own wording, while these artifacts carry the controlled
+	// attribution reported in the campaign summary.
+	for _, name := range []string{"bulk_bottleneck_shared", "bulk_bottleneck_split"} {
+		name := name
+		base := ctrlCases[name]
+		ctrlCases["p1offq_"+name] = func() ctrlCase {
+			c := base()
+			c.Netem.Name = "p1offq_" + c.Netem.Name
+			c.UplinkSourceBPS = 8_192
+			return c
+		}
+	}
+	// P1-on variants (tsshd#6): the same cases with the server's KCP
+	// downlink wire budget configured (the p1_ prefix). The recipe is
+	// 0.7 x the case's bottleneck wire rate: 175,000 B/s at the 2 Mbps
+	// reference (0.7 x 250,000). The clean-link regression uses the design's
+	// separately-configured 200 Mbps cap (25,000,000 B/s) on the 100 Mbps
+	// case - never the weak-link recipe. Uncapped cases (baseline, loss20,
+	// loss20_flood, slow_client, integrity_clean, integrity_flood) have no
+	// bottleneck of their own, so they run the weak-link recipe: the pacer
+	// is then the binding downlink constraint even on a clean link, which
+	// is the non-trivial form of "pacing must not hurt this case".
+	p1Pace := func(c ctrlCase, wireBPS int64) ctrlCase {
+		c.P1WireBPS = wireBPS
+		return c
+	}
+	const p1WeakLinkWireBPS = 175_000    // 0.7 x 250,000 B/s (2 Mbps reference)
+	const p1CleanCapWireBPS = 25_000_000 // 200 Mbps cap on the 100 Mbps clean case
+	for _, name := range []string{
+		// row 1 P1-on: the 8 committed input-delivery cases
+		"input_baseline", "loss20", "input_loss20_flood", "input_slow_client",
+		"input_bottleneck_upclean", "input_bottleneck_split",
+		"input_bottleneck_shared", "input_paste_shared_reading",
+		// row 6 P1-on one-way clean amplification reference
+		"baseline",
+		// row 5 P1-on: clean capped + degraded shared/split
+		"bulk_clean_cap200", "bulk_bottleneck_shared", "bulk_bottleneck_split",
+		// row 7 P1-on: roam + attach under load
+		"reconnect_roam", "reconnect_attach",
+		// row 8 P1-on: no-shed integrity
+		"integrity_clean", "integrity_flood",
+	} {
+		name := name
+		base := ctrlCases[name]
+		wireBPS := int64(p1WeakLinkWireBPS)
+		if name == "bulk_clean_cap200" {
+			wireBPS = p1CleanCapWireBPS
+		}
+		ctrlCases["p1_"+name] = func() ctrlCase {
+			c := p1Pace(base(), wireBPS)
+			c.Netem.Name = "p1_" + c.Netem.Name
+			// Pacing bounds the drain rate, so patience bounds grow with the
+			// paced transfer time (1 MiB integrity payload ~13 s at the recipe;
+			// the roam child's 15 s of output drains ~10 s) while every bound
+			// stays well under the documented liveness limits.
+			switch name {
+			case "integrity_clean":
+				c.WaitTimeout = 60 * time.Second
+			case "integrity_flood":
+				c.WaitTimeout = 90 * time.Second
+			case "reconnect_roam", "reconnect_attach":
+				c.WaitTimeout = 75 * time.Second
+			case "bulk_bottleneck_shared", "bulk_bottleneck_split":
+				// Bounded uplink source: see ctrlCase.UplinkSourceBPS. ~3x the
+				// measured canonical-PTY ldisc drain keeps the uplink direction
+				// measured without fabricating an uplink-side collapse.
+				c.UplinkSourceBPS = 8_192
+			}
+			return c
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1326,14 @@ type ctrlSample struct {
 	// paste pipe-write time when the case repeats its paste stimulus.
 	QLenPktsAtInject *int     `json:"qlen_pkts_at_inject,omitempty"`
 	PasteMs          *float64 `json:"paste_pipe_write_ms,omitempty"`
+
+	// MarkerWriteMonoNS is when the child COMPLETED writing its post-SIGINT
+	// marker to the PTY (side channel MARKERWRITTEN). MarkerMs therefore
+	// decomposes into MarkerWriteMs (child-side PTY backpressure: how long the
+	// marker write itself waited behind the flood) and the remainder
+	// (transport: everything already queued ahead of the marker).
+	MarkerWriteMonoNS int64    `json:"marker_write_mono_ns,omitempty"`
+	MarkerWriteMs     *float64 `json:"marker_write_ms,omitempty"` // inject -> child wrote marker
 }
 
 type ctrlBudgetMetrics struct {
@@ -1250,6 +1358,11 @@ type ctrlResult struct {
 	WarmupSec int    `json:"warmup_sec"`
 	DrainBPS  int64  `json:"drain_bps"`
 
+	// P1WireBPS is the server KCP downlink wire budget configured for this
+	// run (0 = pacing off). It is recorded in the artifact so a suite is
+	// self-describing about which pacing configuration produced it.
+	P1WireBPS int64 `json:"p1_wire_bps,omitempty"`
+
 	// timestamps (CLOCK_MONOTONIC ns) and derived deltas (ms)
 	TInject        int64 `json:"t_inject_ns"`
 	TPipeWriteDone int64 `json:"t_pipe_write_done_ns"`
@@ -1268,6 +1381,7 @@ type ctrlResult struct {
 	PastePipeWriteMs *float64 `json:"paste_pipe_write_ms,omitempty"`
 
 	Samples           []ctrlSample `json:"samples,omitempty"`
+	MarkersObserved   int          `json:"markers_observed,omitempty"`
 	CtrlP50Ms         *float64     `json:"ctrl_p50_ms,omitempty"`
 	CtrlP95Ms         *float64     `json:"ctrl_p95_ms,omitempty"`
 	CtrlMaxMs         *float64     `json:"ctrl_max_ms,omitempty"`
@@ -1553,12 +1667,21 @@ func (d *ctrlDrainState) markerTime() int64 {
 	return d.markerTNS
 }
 
+// markerCount returns how many post-interrupt markers the client has seen
+// (cumulative). NOTE: d.countedMarker is the count within the retained scan
+// tail and is reset on every trim - it is a scan-dedup cursor, never a total.
+func (d *ctrlDrainState) markerCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.markerTimes)
+}
+
 func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 	res := &ctrlResult{
 		Case: cfg.Netem.Name, Netem: cfg.Netem, Expect: cfg.Expect.String(),
 		ChildMode: cfg.ChildMode,
 		PasteKB:   cfg.PasteKB, WarmupSec: int(cfg.Warmup / time.Second),
-		DrainBPS: cfg.DrainBPS, OK: false,
+		DrainBPS: cfg.DrainBPS, P1WireBPS: cfg.P1WireBPS, OK: false,
 	}
 
 	// ---- side channel ----
@@ -1578,7 +1701,9 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 	savedSSHConn := os.Getenv("SSH_CONNECTION")
 	_ = os.Setenv("SSH_CONNECTION", "")
 	serverArgs := &tsshdArgs{KCP: true, IPv4: true, ConnectTimeout: 10 * time.Second,
-		Attachable: cfg.AttachAfterDetach}
+		Attachable:  cfg.AttachAfterDetach,
+		KcpWireRate: uint64(cfg.P1WireBPS),
+	}
 	info, _, err := initServer(serverArgs)
 	_ = os.Setenv("SSH_CONNECTION", savedSSHConn)
 	if err != nil {
@@ -1753,7 +1878,7 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 		uplinkWriterDone = make(chan struct{})
 		go func() {
 			defer close(uplinkWriterDone)
-			ctrlWriteBulkInput(stdin, 12*time.Second)
+			ctrlWriteBulkInput(stdin, 12*time.Second, cfg.UplinkSourceBPS)
 		}()
 	}
 
@@ -1893,6 +2018,32 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 	}
 	drain.mu.Lock()
 	res.ClientBytesTotal = drain.bytes
+	if os.Getenv("TSSHD_CTRL_BENCH_DEBUG") != "" {
+		// harness development: the client receive timeline so pacing/ramp
+		// anomalies are visible in any case mode. Runs under the ONE outer
+		// drain.mu critical section - an inner Unlock here would make the
+		// outer Unlock a fatal unlock-of-unlocked-mutex (round-3 review
+		// finding).
+		t0 := int64(0)
+		if len(drain.byteSamples) > 0 {
+			t0 = drain.byteSamples[0].TNS
+		}
+		last := int64(-1_000_000_000)
+		for _, s := range drain.byteSamples {
+			if s.TNS-last >= 500_000_000 {
+				fmt.Printf("[BYTE-SAMPLE] t=%7.3fs bytes=%d\n", float64(s.TNS-t0)/1e9, s.Bytes)
+				last = s.TNS
+			}
+		}
+		if len(drain.byteSamples) > 0 {
+			fmt.Printf("[BYTE-SAMPLE] total=%d n=%d\n", drain.byteSamples[len(drain.byteSamples)-1].Bytes, len(drain.byteSamples))
+		}
+		fmt.Printf("[BYTE-SAMPLE] markers at:")
+		for _, m := range drain.markerTimes {
+			fmt.Printf(" %.3f", float64(m-t0)/1e9)
+		}
+		fmt.Println()
+	}
 	res.DiscardWarnings = drain.discardWarnings
 	res.DiscardedOutputLines = discardStats.lines.Load()
 	res.DiscardedOutputBytes = discardStats.outBytes.Load()
@@ -2017,6 +2168,7 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 		drain.mu.Lock()
 		echos := append([]int64(nil), drain.echoTimes...)
 		markers := append([]int64(nil), drain.markerTimes...)
+		res.MarkersObserved = len(markers)
 		drain.mu.Unlock()
 		if len(echos) > 0 {
 			es := make([]float64, 0, len(echos))
@@ -2137,15 +2289,17 @@ func ctrlRunDataCase(cfg ctrlCase, res *ctrlResult, events <-chan ctrlEvent, dra
 	}
 }
 
-func ctrlWriteBulkInput(stdin io.Writer, duration time.Duration) {
+func ctrlWriteBulkInput(stdin io.Writer, duration time.Duration, sourceBPS int64) {
 	// PTY canonical mode can buffer un-terminated input. Use newline-terminated
 	// records so this really measures bytes accepted by the child, not pipe writes.
 	buf := bytes.Repeat([]byte{'u'}, 32*1024)
 	buf[len(buf)-1] = '\n'
+	if sourceBPS <= 0 {
+		sourceBPS = int64(800_000) // avoid overloading kcp with bidirectional traffic
+	}
 	started := time.Now()
 	deadline := started.Add(duration)
 	var total int64
-	const sourceBPS = int64(800_000) // avoid overloading kcp with bidirectional traffic
 	for time.Now().Before(deadline) {
 		n, err := stdin.Write(buf)
 		total += int64(n)
@@ -2337,6 +2491,10 @@ func ctrlRunCountCase(cfg ctrlCase, res *ctrlResult, events <-chan ctrlEvent,
 		paste = bytes.Repeat([]byte{'x'}, cfg.PasteKB*1024-1)
 		paste = append(paste, '\n')
 	}
+	// markerWrites[i] is the child-side completion time of the i-th
+	// post-SIGINT marker write (side channel MARKERWRITTEN), used to
+	// decompose confirmation latency into child-PTY and transport parts.
+	markerWrites := make([]int64, target+2)
 	for i := 0; i < target; i++ {
 		var pasteMs *float64
 		if paste != nil {
@@ -2378,6 +2536,10 @@ func ctrlRunCountCase(cfg ctrlCase, res *ctrlResult, events <-chan ctrlEvent,
 						PasteMs:          pasteMs,
 					})
 					break waitSig
+				case "MARKERWRITTEN":
+					if ev.Extra >= 1 && int(ev.Extra) < len(markerWrites) {
+						markerWrites[ev.Extra] = ev.MonoNS
+					}
 				case "LASTWRITE":
 					res.ChildWroteBytes = uint64(ev.Extra)
 				case "ECHO_OFF_FAILED":
@@ -2412,22 +2574,91 @@ func ctrlRunCountCase(cfg ctrlCase, res *ctrlResult, events <-chan ctrlEvent,
 		select {
 		case <-time.After(300 * time.Millisecond):
 		case ev, ok := <-events:
-			if ok && ev.Name == "EXIT" {
+			if !ok {
+				continue
+			}
+			// Every event consumed here must be either handled or harmless;
+			// silently dropping MARKERWRITTEN left the marker_write_ms
+			// decomposition sparse (review finding: dropped events).
+			if ev.Name == "EXIT" {
 				return
+			}
+			if ev.Name == "MARKERWRITTEN" && ev.Extra >= 1 && int(ev.Extra) < len(markerWrites) {
+				markerWrites[ev.Extra] = ev.MonoNS
 			}
 		}
 	}
 
 	// drain remaining child events (EXIT expected)
 	idle := time.After(2 * time.Second)
+drainEvents:
 	for {
 		select {
-		case _, ok := <-events:
+		case ev, ok := <-events:
 			if !ok {
-				return
+				break drainEvents
+			}
+			if ev.Name == "MARKERWRITTEN" && ev.Extra >= 1 && int(ev.Extra) < len(markerWrites) {
+				markerWrites[ev.Extra] = ev.MonoNS
 			}
 		case <-idle:
-			return
+			break drainEvents
+		}
+	}
+	// Marker-drain: the sample loop advances at the pace of SIGINT delivery
+	// (fast once pacing un-pins the queue), while the markers themselves drain
+	// behind the standing output backlog. Wait for every marker the child
+	// wrote (bounded), so the confirmation p95 is computed over all samples
+	// instead of being truncated by the run's end - without this, paced runs
+	// undercount their own tail (measured: markers 15-30 arriving seconds
+	// after the last sample's 2 s idle drain expired). The 120 s floor covers
+	// the UNPACED row-2 baselines too (same-pin P1-off shared confirmation
+	// p95 is 8-12 s with individual markers past 30 s): a 30 s bound would
+	// reproduce the truncated-prefix defect on the before-side of the
+	// before/after comparison (review finding). The loop still ends at the
+	// first of: all markers seen, side channel closed, or the deadline -
+	// fast runs exit in milliseconds.
+	markerPatience := 120 * time.Second
+	if cfg.SampleTimeout > markerPatience {
+		markerPatience = cfg.SampleTimeout
+	}
+	markerDeadline := time.After(markerPatience)
+markerDrain:
+	for drain.markerCount() < target {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				break markerDrain
+			}
+			if ev.Name == "MARKERWRITTEN" && ev.Extra >= 1 && int(ev.Extra) < len(markerWrites) {
+				markerWrites[ev.Extra] = ev.MonoNS
+			}
+			if ev.Name == "EXIT" {
+				break markerDrain
+			}
+		case <-time.After(200 * time.Millisecond):
+			// The side channel goes quiet once the child has written every
+			// marker (measured: all 30 child-side writes complete within
+			// ~1.4 s under recipe pacing; unpaced runs starve individual
+			// marker writes for up to ~9.4 s behind the flood's fd mutex),
+			// so without this tick the select would sleep to the patience
+			// deadline even after the last marker reached the client; the
+			// tick re-checks markerCount.
+		case <-markerDeadline:
+			break markerDrain
+		}
+	}
+	attachMarkerWriteTimes(res, markerWrites)
+}
+
+// attachMarkerWriteTimes records the child-side marker completion times onto
+// the samples (decomposition input for confirmation latency).
+func attachMarkerWriteTimes(res *ctrlResult, markerWrites []int64) {
+	for i := range res.Samples {
+		if i+1 < len(markerWrites) && markerWrites[i+1] > 0 && res.Samples[i].InjectMonoNS > 0 {
+			res.Samples[i].MarkerWriteMonoNS = markerWrites[i+1]
+			v := float64(markerWrites[i+1]-res.Samples[i].InjectMonoNS) / 1e6
+			res.Samples[i].MarkerWriteMs = &v
 		}
 	}
 }
@@ -2490,6 +2721,29 @@ func ctrlGateShedSettled(res *ctrlResult) error {
 	return nil
 }
 
+// ctrlP1OffSamePinRef holds the same-pin P1-off reference values the tsshd#6
+// P1-on gates compare against (the "before" half of the before/after
+// campaign). Seeded from the committed tsshd#3 suites (an older pin) so the
+// gate is never unenforced; each value is refreshed from this campaign's
+// P1-off re-runs at the current pin, and the refresh is recorded on the
+// work item timeline per the gate discipline.
+var ctrlP1OffSamePinRef = map[string]float64{
+	// Same-pin P1-off medians/maxima, measured 2026-09-18 by this campaign's
+	// before runs (results/p1off-*.json, 3 seeded runs each, current pin with
+	// tsshd#11 + tsshd#12 landed). Seeded originally from the committed
+	// tsshd#3 suites (pre-tsshd#11/#12 pin); the refresh is recorded on the
+	// work item timeline per the gate discipline.
+	"bulk_clean_cap200_median_bps":      1_179_240.0, // runs 1165851/1179240/1184154
+	"bulk_bottleneck_shared_median_bps": 10_650.0,    // runs 4915/10650/36864 (deeper collapse than the committed 14746.6)
+	"bulk_bottleneck_split_median_bps":  38_502.0,    // runs 70451/38092/38502 (committed 66764.8 was a luckier regime)
+	"bulk_clean_cap200_max_amp":         3.428,       // runs 3.356/3.428/3.331 egress amp
+	"reconnect_roam_max_ms":             1140.4,      // runs 834.8/936.6/1140.4; suite max, the committed row-7 convention
+	"reconnect_attach_max_ms":           1015.7,      // runs 1015.7/721.0/823.6; suite max (the attach statistic's natural spread at this pin is +/-150 ms in BOTH configurations, so the committed gate's max+10% band - not median+10% - is the calibrated comparison)
+}
+
+// ctrlApplyCurrentGates enforces, per run, the gates whose baselines are
+// already committed at the harness pins. P1-on cases (the p1_ prefix, tsshd#6)
+// gate against the same envelopes plus the pacing-specific thresholds.
 func ctrlApplyCurrentGates(res *ctrlResult) {
 	// Row 1, P1 off, the two clean-uplink cases: a committed single value
 	// (the exact figures from the tsshd#1 artifacts, results/baseline.json
@@ -2597,6 +2851,150 @@ func ctrlApplyCurrentGates(res *ctrlResult) {
 		if res.ContinuityGapBytes > 30720*110/100 && res.Failure == "" {
 			res.Failure = fmt.Sprintf("attach continuity gap %dB exceeds [committed-v2] 30720B +10%% (%dB); the pending-output policy lost more of the detach window than the committed baseline (tracked by tsshd#11)",
 				res.ContinuityGapBytes, 30720*110/100)
+		}
+	}
+	// ---- tsshd#6 P1-on gates: server output pacing at the recipe (p1_ prefix) ----
+	if base := strings.TrimPrefix(res.Case, "p1_"); base != res.Case {
+		// Row 1 P1-on: input delivery stays within the SAME per-case envelopes
+		// as P1-off (+10%). Pacing the downlink must not degrade the input
+		// path; on the bottleneck cases it should be far under the envelope
+		// (the queue is no longer pinned), and on the clean cases the pacer is
+		// the binding downlink constraint, so the input p95 still exercises
+		// ACK/control headroom rather than trivially passing.
+		if committed, ok := v2Baseline[base]; ok {
+			gateInputP95(committed, "[committed-v2]")
+		} else if committed, ok := baseline[base]; ok {
+			gateInputP95(committed, "[committed]")
+		}
+		// Row 2 P1-on: each run's confirmation p95 <= 1.5 s at 2 Mbps + 20%
+		// loss + flood with recipe pacing (design section 7 row 2). The p95
+		// is only citable with full marker coverage: a prefix of observed
+		// markers computes the max of the fast survivors and understates the
+		// tail (review finding: the first split run had 3 of 30 markers).
+		if base == "input_bottleneck_shared" || base == "input_bottleneck_split" {
+			if res.MarkersObserved < len(res.Samples) {
+				if res.Failure == "" {
+					res.Failure = fmt.Sprintf("row-2 P1-on gate not citable: %d of %d markers observed (confirmation p95 over a truncated prefix)",
+						res.MarkersObserved, len(res.Samples))
+				}
+			} else if res.ConfirmationP95Ms == nil {
+				if res.Failure == "" {
+					res.Failure = "row-2 P1-on gate has no confirmation p95"
+				}
+			} else if *res.ConfirmationP95Ms > 1500 && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on confirmation p95 %.3fms exceeds 1500ms (design section 7 row 2)",
+					*res.ConfirmationP95Ms)
+			}
+		}
+		// Row 5 P1-on: clean capped >= 90% of the same-pin P1-off median;
+		// degraded >= the pinned formula floor (0.8 x (1.4 Mbps / amp),
+		// recomputed for the evidence-backed amp tightening 2.2 -> 2.6 to
+		// 53,846 B/s = 430.8 kbps) AND the unpaced-relative clause, per run.
+		// Downlink only: the paced direction. The uplink is reported alongside
+		// but is bounded by
+		// the canonical PTY line discipline (~4 KB per line per round trip),
+		// not the transport, so no absolute floor gates it.
+		switch base {
+		case "bulk_clean_cap200":
+			floor := 0.9 * ctrlP1OffSamePinRef["bulk_clean_cap200_median_bps"]
+			if res.GoodputBPS < floor && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on clean goodput %.1f B/s < 90%% of same-pin P1-off median (%.1f B/s)",
+					res.GoodputBPS, ctrlP1OffSamePinRef["bulk_clean_cap200_median_bps"])
+			}
+		case "bulk_bottleneck_shared", "bulk_bottleneck_split":
+			unpaced := ctrlP1OffSamePinRef[base+"_median_bps"]
+			// Pinned formula floor 0.8 x (1.4 Mbps / amp), in the metric's
+			// bytes/s units: 0.8 x 175,000 / 2.6 = 53,846 B/s = 430.8 kbps.
+			// (Correction recorded on the tsshd#6 timeline: the campaign note
+			// claiming "0.8x(1.4Mbps/2.6)=41176" had actually evaluated the
+			// formula at the TESTED amp 3.4 - 41,176 = 0.8 x 175,000 / 3.4 - not
+			// at the pinned amp_estimate 2.6 the wi's formula names; the gate
+			// now uses the correct 2.6 evaluation. The wi's own worked example
+			// at amp 2.2, 0.8 x 175,000 / 2.2 = 63,636 B/s ~ 0.5 Mbps, confirms
+			// the reading.)
+			const kP1FormulaFloorBPS = 53_846.0
+			floor := max(kP1FormulaFloorBPS, 2*unpaced)
+			cmpWord := "AND 2x"
+			if base == "bulk_bottleneck_split" {
+				// The 2x-unpaced clause presumes the unpaced degraded case
+				// collapsed; the committed unpaced SPLIT baseline (66,764.8 B/s
+				// median) did not - its per-direction queue leaves the uplink
+				// uncongested, and loss recovery alone already capped it at
+				// 99.2% of the recipe's payload offer ceiling (67,307.7 B/s at
+				// the 2 Mbps reference). 2x is therefore unreachable by ANY
+				// pacing configuration, and the binding comparison for split
+				// is the formula floor plus no-regression parity against the
+				// COMMITTED unpaced baseline (pacing must not make the
+				// uncollapsed case worse). The same-pin median (38,502 B/s) is
+				// reported alongside but never used as the parity reference:
+				// it sits below the formula floor and would make the clause
+				// non-binding (review finding). Recorded on the tsshd#6
+				// timeline with the campaign artifacts.
+				floor = max(kP1FormulaFloorBPS, 0.95*66_764.8)
+				cmpWord = "AND no-regression vs committed"
+			}
+			if res.GoodputBPS < floor && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on degraded goodput %.1f B/s < floor %.1f B/s (pinned formula 0.8 x (1.4 Mbps / 2.6) = 53846 %s unpaced %.1f B/s)",
+					res.GoodputBPS, floor, cmpWord, unpaced)
+			}
+		}
+		// Row 6 P1-on: one-way clean reference <= 2.8x; degraded bulk <= 4.0x
+		// egress-based while meeting row 5 (a row-5 failure already fails the
+		// run); clean capped bulk must not exceed the same-pin P1-off max
+		// amplification +10% (pacing must not worsen it - the 2.8x figure is
+		// only decidable on the one-way reference, where the committed 2.679x
+		// was measured; the bidirectional bulk denominator changed when PTY
+		// echo was disabled, see the row-6 P1-off contract note).
+		if res.Budget.EgressAmplification != nil {
+			amp := *res.Budget.EgressAmplification
+			switch base {
+			case "baseline":
+				if amp > 2.8 && res.Failure == "" {
+					res.Failure = fmt.Sprintf("P1-on one-way clean amplification %.3fx exceeds 2.8x", amp)
+				}
+			case "bulk_bottleneck_shared", "bulk_bottleneck_split":
+				if amp > 4.0 && res.Failure == "" {
+					res.Failure = fmt.Sprintf("P1-on degraded amplification %.3fx exceeds 4.0x", amp)
+				}
+			case "bulk_clean_cap200":
+				if limit := ctrlP1OffSamePinRef["bulk_clean_cap200_max_amp"] * 1.10; amp > limit && res.Failure == "" {
+					res.Failure = fmt.Sprintf("P1-on clean capped amplification %.3fx exceeds same-pin P1-off max %.3fx +10%%", amp, ctrlP1OffSamePinRef["bulk_clean_cap200_max_amp"])
+				}
+			}
+		}
+		// Row 7 P1-on: reattach/attach within the same-pin P1-off median +10%;
+		// roam exact byte continuity and the attach gap bound. (Byte
+		// continuity itself is asserted in ctrlRunCase for zero-discard runs;
+		// tsshd#11 landed, so the attach gap is expected to be 0 — the
+		// committed 30720B +10% stays the outer bound.)
+		if res.ReconnectOutageMS > 0 && res.ReattachMs > 0 {
+			// The committed row-7 P1-off gate binds at suite max +10%; the
+			// P1-on gate follows the same convention against the same-pin
+			// suite max (the reattach/attach statistics' natural spread at
+			// this pin is wider than median+10% in BOTH configurations).
+			if limit := ctrlP1OffSamePinRef["reconnect_roam_max_ms"] * 1.10; res.ReattachMs > limit && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on roam reattach %.3fms exceeds same-pin P1-off max %.3fms +10%% (%.3fms)",
+					res.ReattachMs, ctrlP1OffSamePinRef["reconnect_roam_max_ms"], limit)
+			}
+		}
+		if res.AttachAfterDetach {
+			if limit := ctrlP1OffSamePinRef["reconnect_attach_max_ms"] * 1.10; res.AttachMs > limit && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on attach %.3fms exceeds same-pin P1-off max %.3fms +10%% (%.3fms)",
+					res.AttachMs, ctrlP1OffSamePinRef["reconnect_attach_max_ms"], limit)
+			}
+			if res.ContinuityGapBytes > 30720*110/100 && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on attach continuity gap %dB exceeds [committed-v2] 30720B +10%% (%dB)",
+					res.ContinuityGapBytes, 30720*110/100)
+			}
+		}
+		// Row 8 P1-on: byte integrity under pacing — pacing delays bytes, it
+		// must never drop or alter them. (diff != 0 already sets Failure in
+		// the integrity case runner; this block keeps the gate visible here
+		// and catches a regression in that enforcement path.)
+		if base == "integrity_clean" || base == "integrity_flood" {
+			if res.IntegrityDiffBytes != 0 && res.Failure == "" {
+				res.Failure = fmt.Sprintf("P1-on raw PTY byte diff=%d", res.IntegrityDiffBytes)
+			}
 		}
 	}
 	res.OK = res.Failure == "" && res.OK

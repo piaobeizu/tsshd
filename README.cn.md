@@ -282,6 +282,8 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
 - 如果存在 `$XDG_CONFIG_HOME/tsshd/sshd_config`（默认 `~/.config/tsshd/sshd_config`），tsshd 会优先使用它（即使文件为空）。
 
+- `KcpWireRate <bytes/s>`（仅 KCP）：限制服务端会话输出的下行 wire 预算（字节/秒）。命令行 `--kcp-wire-rate <bytes/s>` 设置同一开关，优先于配置文件；`0`（默认）表示关闭限速。预算计入会话输出在链路上产生的一切字节 —— FEC 1+1 奇偶包（每个数据报翻倍）、传输帧开销、丢包重传 —— 因此 PTY 输出获得的 payload 令牌速率为 `预算 / 2.6` 字节/秒。推荐配置：约为瓶颈链路速率的 0.7 倍（例如 2 Mbps 瓶颈用 `175000`），使瓶颈队列不再饱和，输出洪峰期间控制输入与上行 ACK 仍有链路时间；不开启时，弱网上的输出洪峰会把 Ctrl-C 确认拖到数秒级（见 `benchmarks/control-latency/README.md`）。同一个 KCP 连接上的所有会话 stdout/stderr 共享一个预算；端口转发与数据报流不计入（v1 限制）。tsshd 未以 `--kcp` 启动时忽略并告警。
+
 ### Client 配置 (tssh)
 
 ```

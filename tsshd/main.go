@@ -81,6 +81,18 @@ type tsshdArgs struct {
 	MTU            uint16
 	Port           string
 	ConnectTimeout time.Duration
+
+	// KcpWireRate is the downlink WIRE budget in bytes/s for KCP connections:
+	// the ceiling on wire bytes offered to the link (FEC parity packets and
+	// transport framing included) by pacing session PTY output. 0 (the
+	// default) disables pacing. The payload token rate granted to PTY output
+	// is KcpWireRate / kWireAmpEstimate (see output.go).
+	KcpWireRate uint64
+
+	// kcpWireRateSet records that --kcp-wire-rate appeared on the command
+	// line, so an explicit `--kcp-wire-rate 0` overrides a nonzero
+	// sshd_config KcpWireRate (flag presence, not flag value, wins).
+	kcpWireRateSet bool
 }
 
 func printHelp() int {
@@ -103,6 +115,14 @@ func printHelp() int {
 		"  --view <PID>.<SID>     Print the screen contents of the session\n" +
 		"  --attach <PID>         Attach to tsshd session specified by PID\n" +
 		"  --mtu N                Sets the Maximum Transmission Unit (MTU)\n" +
+		"  --kcp-wire-rate N      KCP only: pace session output below a downlink wire budget\n" +
+		"                           in bytes/s (0 = off, the default). Recommended: ~0.7 x the\n" +
+		"                           bottleneck link's rate. Payload output is granted roughly\n" +
+		"                           N/2.6 bytes/s (FEC 1+1 doubles wire datagrams plus framing and\n" +
+		"                           retransmission overhead; see docs/weak-network-agent-design.md).\n" +
+		"                           Keeps the bottleneck queue out of saturation so control input\n" +
+		"                           and uplink ACKs get through while output floods. Ignored\n" +
+		"                           without --kcp. Can also be set in sshd_config as KcpWireRate.\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
 	return 0
@@ -151,6 +171,16 @@ func parseTsshdArgs() *tsshdArgs {
 				}
 				i++
 			}
+		case "--kcp-wire-rate":
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				if rate, err := strconv.ParseUint(os.Args[i+1], 10, 64); err == nil {
+					args.KcpWireRate = rate
+					args.kcpWireRateSet = true
+				} else {
+					warning("--kcp-wire-rate [%s] invalid: %v", os.Args[i+1], err)
+				}
+				i++
+			}
 		case "--port":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				args.Port = os.Args[i+1]
@@ -169,6 +199,38 @@ func parseTsshdArgs() *tsshdArgs {
 }
 
 const kEnvTsshdBackground = "TRZSZ-SSHD-BACKGROUND"
+
+// resolveKcpWireRate applies the --kcp-wire-rate precedence: the command-line
+// flag wins; when it is unset (0 = off, the default), the sshd_config
+// `KcpWireRate <bytes/s>` key is honored so deployments can configure the
+// recipe without editing the client-facing command. An invalid config value
+// is a warning plus "off", never a startup failure. The knob only applies to
+// KCP connections and is ignored (with a warning) without --kcp; QUIC has its
+// own congestion control.
+// kMinKcpWireRate is the pacing floor below which the configuration is almost
+// certainly a mistake: at this rate the payload token grant is 4096/2.6 ~=
+// 1.575 KB/s, so a single 32 KiB output chunk holds its session's writer (and,
+// on a closing connection, that writer's goroutine) for ~21 s. The pacer still
+// runs below it - the floor only produces a warning, never a silent clamp.
+const kMinKcpWireRate = 4096
+
+func resolveKcpWireRate(flagRate uint64, flagSet bool, configVal string, kcp bool) uint64 {
+	if !flagSet && flagRate == 0 && configVal != "" {
+		if rate, err := strconv.ParseUint(configVal, 10, 64); err == nil {
+			flagRate = rate
+		} else {
+			warning("sshd_config KcpWireRate [%s] invalid: %v", configVal, err)
+		}
+	}
+	if flagRate > 0 && !kcp {
+		warning("--kcp-wire-rate %d B/s ignored: not a KCP (--kcp) server; output pacing is KCP-only", flagRate)
+		return 0
+	}
+	if flagRate > 0 && flagRate < kMinKcpWireRate {
+		warning("--kcp-wire-rate %d B/s is below the %d B/s floor: at such rates a single 32 KiB output chunk would hold its session's writer for a very long time, and shutdown of a paced connection can retain the writer goroutine for up to that long; the pacer will run but is almost certainly misconfigured", flagRate, kMinKcpWireRate)
+	}
+	return flagRate
+}
 
 func background() (bool, io.ReadCloser, error) {
 	if v := os.Getenv(kEnvTsshdBackground); v == "TRUE" {
@@ -293,6 +355,8 @@ func RunMain(opts ...Option) (int, error) {
 	}
 
 	initSshdConfig()
+
+	args.KcpWireRate = resolveKcpWireRate(args.KcpWireRate, args.kcpWireRateSet, getSshdConfig("KcpWireRate"), args.KCP)
 
 	if !enableDebugLogging {
 		if v := getSshdConfig("LogLevel"); strings.EqualFold(v, "quiet") || strings.EqualFold(v, "fatal") {
