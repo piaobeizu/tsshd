@@ -52,6 +52,12 @@ var maxPendingOutputLines = 1000
 var discardMarkerCurrentIndex uint32
 var discardMarkerIndexMutex sync.Mutex
 
+// kFirstInputEpoch is the epoch a session starts in. Server-assigned
+// epochs begin at 1 so that a startResponse carrying no Epoch (an old
+// server, or the omitempty zero value) is distinguishable from a real
+// one - the client treats a zero epoch as "feature unsupported".
+const kFirstInputEpoch = 1
+
 func (s *sshUdpServer) enablePendingInputDiscard() {
 	if s.keepPendingInput.Load() {
 		return
@@ -75,20 +81,117 @@ func (s *sshUdpServer) enablePendingInputDiscard() {
 		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),
 	}
 
+	// On InputAck-negotiating connections each session gets its own
+	// classified inputBoundary report through the ordered sender; on
+	// legacy connections the marker announcement stays the one broadcast
+	// message it is today.
+	ack := s.inputAck.Load()
 	for _, sess := range sessions {
 		if sess.server.Load() != s {
 			// Skip sessions that are no longer owned by this server.
 			continue
 		}
-		sess.discardMarker.Store(&marker)
+		sess.installInputBoundary(s, marker, ack)
 	}
 
-	go func() {
-		debug("discard input marker: %X", marker)
-		if err := s.sendBusMessage("discard", discardMessage{DiscardMarker: marker}); err != nil {
-			warning("send discard marker [%X] failed: %v", marker, err)
+	if !ack {
+		go func() {
+			debug("discard input marker: %X", marker)
+			if err := s.sendBusMessage("discard", discardMessage{DiscardMarker: marker}); err != nil {
+				warning("send discard marker [%X] failed: %v", marker, err)
+			}
+		}()
+	}
+}
+
+// installInputBoundary establishes an input boundary on one session with
+// the shared reconnect marker. On InputAck-negotiating connections it
+// follows reserve-before-mutate (R7-B3): BOTH report slots (boundary +
+// completion) are reserved before any state changes, then the epoch bumps
+// and the inputBoundary report is enqueued at the point of state change.
+// On reservation failure the marker is NOT installed, the epoch does not
+// bump, and the session refuses input until a boundary can be established
+// (a later successful install, or an attach - a matched boundary by
+// construction). Non-negotiating connections keep today's unconditional
+// install with no epoch bookkeeping.
+func (c *sessionContext) installInputBoundary(server *sshUdpServer, marker []byte, ack bool) bool {
+	if !ack {
+		// Legacy: exactly today's behavior - unconditional install.
+		c.discardMarker.Store(&marker)
+		return true
+	}
+
+	sender := server.orderedSender
+	if sender == nil {
+		return false
+	}
+	if !sender.reserveReports(c, 2) {
+		// R7-B3: no capacity - refuse rather than install an undisclosed
+		// marker. Input is dropped until a boundary is established.
+		c.inputStateMu.Lock()
+		c.inputRefused = true
+		c.inputStateMu.Unlock()
+		warning("session [%d] refuses input: no report capacity for the discard marker", c.id)
+		return false
+	}
+
+	c.inputStateMu.Lock()
+	defer c.inputStateMu.Unlock()
+
+	// A previous, never-completed boundary is superseded: release its
+	// stale completion slot (the occupancy stays bounded at 2 entries per
+	// session under repeated reconnects) and fold its accumulated prefix
+	// into the new discard window.
+	c.releasePendingDiscardLocked()
+
+	newEpoch := c.inputApplied.epoch + 1
+	if !sender.enqueueBoundaryReport(c, discardMessage{
+		Kind: kDiscardKindInputBoundary, SessionID: c.id,
+		Epoch: newEpoch, DiscardMarker: marker,
+	}) {
+		// Broken ordered stream: no state change at all - release both
+		// reserved slots, refuse input. The client never saw a boundary, so
+		// its coordinates continue from its last epoch and nothing confirms
+		// (no acks flow on a broken sender) - conservative, never false.
+		sender.releaseReports(c, 2)
+		c.inputRefused = true
+		warning("session [%d] refuses input: ordered stream broken at the discard marker", c.id)
+		return false
+	}
+
+	c.inputAppliedPrev = c.inputApplied
+	c.inputApplied = inputEpochCounter{epoch: newEpoch}
+	c.pendingDiscardEpoch = c.inputAppliedPrev.epoch
+	c.pendingDiscardReserved = true
+	c.pendingDiscardSender = sender
+	c.pendingDiscardMarker = &marker
+	c.discardMarker.Store(&marker)
+	c.inputRefused = false
+	debug("session [%d] input boundary: epoch %d, marker %X", c.id, newEpoch, marker)
+	return true
+}
+
+// releasePendingDiscardLocked releases the completion reservation of an
+// unconsummated boundary (superseded by a newer install, detached, or
+// attached over). Called with inputStateMu held; the owning sender is
+// recorded at install because the session may outlive the connection.
+func (c *sessionContext) releasePendingDiscardLocked() {
+	if c.pendingDiscardReserved {
+		if sender := c.pendingDiscardSender; sender != nil {
+			sender.releaseReports(c, 1)
 		}
-	}()
+	}
+	c.pendingDiscardReserved = false
+	c.pendingDiscardSender = nil
+	c.pendingDiscardMarker = nil
+}
+
+// inputEpoch returns the session's current input epoch - the value the
+// start/attach success response carries.
+func (c *sessionContext) inputEpoch() uint64 {
+	c.inputStateMu.Lock()
+	defer c.inputStateMu.Unlock()
+	return c.inputApplied.epoch
 }
 
 func getNextDiscardMarkerIndex() uint32 {
@@ -135,6 +238,47 @@ type sessionContext struct {
 	screenBuf      chan []byte
 	screenObj      *te.Screen
 	screenMu       sync.Mutex
+
+	// Input-ack coordinate state (tsshd#7, design doc §4.5). inputStateMu
+	// guards every input-path state change: the applied-coordinate
+	// counters, the marker/discard accumulation, the refusal flag and the
+	// boundary reservation bookkeeping. Ack and report ENQUEUES onto the
+	// connection's ordered sender happen under this mutex at the point of
+	// state change, so enqueue order = state-change order = wire order.
+	// Lock order: attachMutex -> inputStateMu -> orderedBusSender.mu.
+	inputStateMu sync.Mutex
+	// inputApplied counts the non-marker bytes written to the PTY master
+	// (writeAll returned) in the CURRENT epoch; inputAppliedPrev holds the
+	// epoch a boundary just closed, so a write that was in flight across
+	// an installation still lands in the epoch it started in (and is
+	// never acked - the boundary report precedes any later ack, and the
+	// client's controls of the closed epoch are invalidated there).
+	inputApplied     inputEpochCounter
+	inputAppliedPrev inputEpochCounter
+	// inputRefused is set when a marker installation could not reserve its
+	// report slots (R7-B3): no boundary could be established, so input is
+	// dropped until one is (a later successful install or an attach).
+	inputRefused bool
+	// pendingDiscardEpoch is the epoch a pending marker's completion
+	// report attributes its discarded prefix to - the epoch the boundary
+	// CLOSED (the pre-marker epoch), NOT the receipt epoch (R7-B4).
+	pendingDiscardEpoch uint64
+	// pendingDiscardMarker identifies which installed marker the held
+	// completion slot belongs to: a re-install interleaving a completion
+	// of the previous marker must not consume or release the new
+	// boundary's reservation.
+	pendingDiscardMarker *[]byte
+	// pendingDiscardReserved mirrors the held completion slot of an
+	// unconsummated boundary; pendingDiscardSender records the connection
+	// whose sender holds it (the session may outlive the connection).
+	pendingDiscardReserved bool
+	pendingDiscardSender   *orderedBusSender
+}
+
+// inputEpochCounter is one epoch's applied-byte count.
+type inputEpochCounter struct {
+	epoch uint64
+	bytes uint64
 }
 
 var sessionMutex sync.Mutex
@@ -225,33 +369,157 @@ func (c *sessionContext) showMotd(stream Stream) {
 	printMotd([]string{"/etc/motd"}) // always print traditional /etc/motd.
 }
 
+// discardPendingInput processes one input chunk while a discard marker is
+// installed: bytes accumulate until the marker is found. The prefix before
+// the marker is the reconnect window's stale input - discarded, and on
+// InputAck connections reported at the pre-marker epoch (the epoch the
+// boundary closed - R7-B4). The surviving suffix after the marker is
+// applied to the PTY and counted in the current epoch. discardPendingInput
+// never waits for queue space inside forwardInput (its slot was reserved
+// at install - R7-B3).
 func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte, marker *[]byte) error {
+	c.inputStateMu.Lock()
+
 	c.discardedInput = append(c.discardedInput, buf...)
 	pos := bytes.Index(c.discardedInput, *marker)
 	if pos < 0 {
+		c.inputStateMu.Unlock()
 		return nil
 	}
 
-	remainingBuffer := c.discardedInput[pos+len(*marker):]
-	if len(remainingBuffer) > 0 {
-		if err := writeAll(c.stdin, remainingBuffer); err != nil {
+	// Copy out under the state mutex; the PTY write happens outside it (a
+	// blocked write must not stall the install/attach paths).
+	var prefixCopy []byte
+	if pos > 0 {
+		prefixCopy = append([]byte(nil), c.discardedInput[:pos]...)
+	}
+	suffix := append([]byte(nil), c.discardedInput[pos+len(*marker):]...)
+	suffixEpoch := c.inputApplied.epoch
+	c.discardedInput = nil
+	c.discardMarker.CompareAndSwap(marker, nil)
+
+	ack := server.inputAck.Load()
+	if sender := server.orderedSender; ack && sender != nil {
+		// The held completion slot belongs to THIS marker only: a re-install
+		// racing this completion has its own reservation (pointer identity
+		// via pendingDiscardMarker), and consuming that one here would both
+		// misattribute the report's epoch and leak the new boundary's slot.
+		ours := c.pendingDiscardReserved && c.pendingDiscardMarker == marker
+		if pos > 0 {
+			// Completion report at the point of state change, consuming the
+			// slot reserved at install (R7-B3), attributed to the epoch the
+			// boundary closed (R7-B4).
+			if sender.enqueueReport(c, discardMessage{
+				Kind: kDiscardKindInputCompleted, SessionID: c.id,
+				Epoch: c.pendingDiscardEpoch, DiscardedInputBytes: uint64(pos),
+			}) {
+				if ours {
+					c.pendingDiscardReserved = false
+					c.pendingDiscardSender = nil
+					c.pendingDiscardMarker = nil
+				}
+			} else if ours {
+				// Broken ordered stream: release the held slot; D is
+				// unreported, which leaves the client's coverage
+				// conservative (an un-subtracted D can only delay a
+				// confirmation, never fabricate one).
+				sender.releaseReports(c, 1)
+				c.pendingDiscardReserved = false
+				c.pendingDiscardSender = nil
+				c.pendingDiscardMarker = nil
+			}
+		} else if ours {
+			// Marker-only discard: nothing was discarded and the boundary
+			// report already reset the client - release the completion slot
+			// without emitting (R7-B3).
+			sender.releaseReports(c, 1)
+			c.pendingDiscardReserved = false
+			c.pendingDiscardSender = nil
+			c.pendingDiscardMarker = nil
+		}
+	}
+	c.inputStateMu.Unlock()
+
+	if len(suffix) > 0 {
+		if err := writeAll(c.stdin, suffix); err != nil {
 			return err
 		}
+		c.countAppliedInput(server, uint64(len(suffix)), suffixEpoch)
 	}
 
 	if pos > 0 {
 		if enableDebugLogging {
-			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedInput[:pos])))
+			debug("discard input: %s", strconv.QuoteToASCII(string(prefixCopy)))
 		}
-		if err := server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedInput[:pos]}); err != nil {
-			warning("send discard message failed: %v", err)
+		if !ack {
+			// Legacy path (unchanged): report the discarded prefix bytes
+			// after the surviving suffix is applied, exactly as before.
+			if err := server.sendBusMessage("discard", discardMessage{DiscardedInput: prefixCopy}); err != nil {
+				warning("send discard message failed: %v", err)
+			}
 		}
 	} else if enableDebugLogging {
 		debug("no pending input to discard")
 	}
 
-	c.discardedInput = nil
-	c.discardMarker.CompareAndSwap(marker, nil)
+	return nil
+}
+
+// countAppliedInput records n bytes accepted by the PTY (writeAll
+// returned) and offers an input_ack. snapEpoch is the epoch current when
+// the write started: a write that crossed a boundary lands in the closed
+// epoch's counter and is never acked - the boundary report precedes any
+// later ack on the wire, and the client's controls of the closed epoch
+// are invalidated at the boundary, so a stale-epoch ack could only add
+// desync noise (R7-B4).
+func (c *sessionContext) countAppliedInput(server *sshUdpServer, n uint64, snapEpoch uint64) {
+	c.inputStateMu.Lock()
+	defer c.inputStateMu.Unlock()
+
+	if c.inputApplied.epoch == snapEpoch {
+		c.inputApplied.bytes += n
+		c.offerInputAckLocked(server, c.inputApplied.epoch, c.inputApplied.bytes)
+	} else if c.inputAppliedPrev.epoch == snapEpoch {
+		c.inputAppliedPrev.bytes += n
+	}
+}
+
+// offerInputAckLocked offers one ack; the caller holds inputStateMu so the
+// enqueue is ordered with the state change it reports.
+func (c *sessionContext) offerInputAckLocked(server *sshUdpServer, epoch, applied uint64) {
+	if !server.inputAck.Load() {
+		return
+	}
+	if sender := server.orderedSender; sender != nil {
+		sender.offerAck(c, epoch, applied, time.Now().UnixMilli())
+	}
+}
+
+// acceptInput applies one input chunk read from the client stream: it is
+// dropped while input is refused (no established boundary - R7-B3),
+// handed to the discard machinery while a marker is installed, otherwise
+// written to the PTY and counted in the current epoch with a post-write
+// ack offer ("raw-mode ack at write return").
+func (c *sessionContext) acceptInput(server *sshUdpServer, buf []byte) error {
+	c.inputStateMu.Lock()
+	if c.inputRefused {
+		c.inputStateMu.Unlock()
+		if enableDebugLogging {
+			debug("session [%d] input dropped: no input boundary established", c.id)
+		}
+		return nil
+	}
+	if marker := c.discardMarker.Load(); marker != nil {
+		c.inputStateMu.Unlock()
+		return c.discardPendingInput(server, buf, marker)
+	}
+	snapEpoch := c.inputApplied.epoch
+	c.inputStateMu.Unlock()
+
+	if err := writeAll(c.stdin, buf); err != nil {
+		return err
+	}
+	c.countAppliedInput(server, uint64(len(buf)), snapEpoch)
 	return nil
 }
 
@@ -271,15 +539,7 @@ func (c *sessionContext) forwardInput(stream Stream) {
 				// nil indicates the session has been detached, input from the old client should be discarded.
 				continue
 			}
-
-			if marker := c.discardMarker.Load(); marker != nil {
-				if err := c.discardPendingInput(server, buffer[:n], marker); err != nil {
-					return
-				}
-				continue
-			}
-
-			if err := writeAll(c.stdin, buffer[:n]); err != nil {
+			if err := c.acceptInput(server, buffer[:n]); err != nil {
 				return
 			}
 		}
@@ -316,11 +576,16 @@ func (c *sessionContext) wirePacer() *wireRatePacer {
 }
 
 func (c *sessionContext) newOutputForwarder(name string, reader io.Reader, stream Stream) *serverOutputForwarder {
+	// The countingWriteProxy tracks the writer-owned bytes of the
+	// in-progress transport write so serverOutputForwarder.inFlightBytes
+	// (the R7-W1 writer-owned handoff backlog) is measurable without
+	// touching output.go. The proxy forwards every method; only Write
+	// accounts.
 	return &serverOutputForwarder{
 		name:       name,
 		sess:       c,
 		reader:     reader,
-		stream:     stream,
+		stream:     &countingWriteProxy{Stream: stream},
 		done:       make(chan struct{}),
 		writeBufCh: make(chan []byte, 1),
 	}
@@ -624,7 +889,7 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
-	if err := sendSuccess(stream); err != nil { // ack ok
+	if err := sendResponse(stream, &startResponse{Epoch: sess.inputEpoch()}); err != nil { // ack ok
 		warning("start session ack ok failed: %v", err)
 		sess.Close()
 		return
@@ -684,6 +949,9 @@ func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext
 		cols:          msg.Cols,
 		rows:          msg.Rows,
 		clientChecker: newReplaceableTimeoutChecker(server.clientChecker),
+		// Server-assigned epochs start at 1 (nonzero = feature present on
+		// the start response; a zero epoch means an old server).
+		inputApplied: inputEpochCounter{epoch: kFirstInputEpoch},
 	}
 	sess.server.Store(server)
 

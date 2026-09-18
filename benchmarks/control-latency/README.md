@@ -106,15 +106,19 @@ number.
 |---|---|---|
 | row 1 input delivery | `input_baseline`, `loss20`, `input_loss20_flood`, `input_slow_client`, `input_bottleneck_upclean`, `input_bottleneck_split`, `input_bottleneck_shared`, `input_paste_shared_reading` | 30 sequential interrupts against a surviving child per run; nearest-rank p95; committed value +10% |
 | row 2 drain confirmation | `input_bottleneck_shared`, `input_bottleneck_split` | per-sample `T_client_marker-T_inject`, nearest-rank p95; P1-off baseline only |
+| row 3(b) ack confirmation (tsshd#7) | `ack_bottleneck_shared` (inactive until the row-3(b) campaign attaches artifacts) | identical stimulus/netem to `input_bottleneck_shared` (unmitigated shared bottleneck, P1 off) with the input-ACCEPTED ack negotiated: per-sample `T_client_ack-T_inject` via the §4.5 coverage rule, paired against the child's post-SIGINT marker; paired-win ≥90% among delivered acks AND delivered-ack coverage ≥20/30 per run AND ack traffic <1% of stream bytes (the artifact carries `ack_events`/`ack_wire_bytes`); ack absent → loss rate, never a win; marker absent within patience → win, noted; tie → not a win; **no absolute latency bound claimed**. A dedicated `ack_*` case keeps rows 1/2's committed stimulus byte-identical (no ack traffic on their baselines) |
 | row 5 bulk goodput | `bulk_clean`, `bulk_clean_cap200`, `bulk_bottleneck_shared`, `bulk_bottleneck_split` | client receive byte samples in `[5s,10s] / 5s`, **each direction in every case**: downlink from client byte samples, uplink from child-received bytes at the same window (child disables PTY echo so the two directions stay separable; no echo feedback storm). The uplink is line-discipline-bound (~4 KB per canonical line per round trip), not transport-bound — the figure measures a canonical-PTY session uplink. Missing child uplink reports fail the run. |
 | row 6 amplification | the four bulk cases + the one-way `baseline` case | `relay.aggregate.egressed_bytes/client_payload`; offered ratio alongside; shared-mode aggregate counted once. The one-way clean reference (`baseline`, ≤2.8× vs committed 2.679×) is gated; the bidirectional bulk family reports [committed-v2] baselines (echo off changes the denominator; the legacy one-way figure is context, not a directly comparable gate). |
 | row 7 reconnect | `reconnect_roam`, `reconnect_attach` | mid-transfer black-hole reconnect and real detach/new-client attach; reattach time plus byte continuity under the unchanged pending-output policy. Roam: **exact equality** required (child total == client total; the child disables PTY OPOST so the count is bytewise-decidable; a missing child total or any unaccounted gap fails the run). Attach: success + attach time required, and the continuity gap is **gated at the committed maximum +10%** (30720 B) — measured 3/3: the detach-window records (~30 x 1024 B) reach neither client with zero discard notices, an un-accounted loss recorded in `continuity_gap_bytes`/`continuity_unaccounted` and in the baselines index; the production defect is tracked by tsshd#11, and exact equality is this case's target once it lands |
 | row 8 integrity | `integrity_clean`, `integrity_flood` | exact framed 1 MiB PTY payload comparison against a server-side PTY reference (`screenBuf` tap, captured before stream forwarding), byte diff must be zero |
 
 Feature-dependent contracts are present but deliberately **inactive**:
-`visible-confirmation-ack-split` / `visible-confirmation-ack-shared` wait for
-tsshd#7 (and the split fast gate also waits for tsshd#6); `post-shed-settle`
-and `raw-pty-byte-integrity-shed` wait for tsshd#8. `TSSHD_CTRL_GATE` only
+`visible-confirmation-ack-split` (row 3(a)) is tsshd#8's entry gate and waits
+for its campaign (the #6+#7 features it measures have landed);
+`visible-confirmation-ack-shared` (row 3(b)) has its measurement case
+(`ack_bottleneck_shared`, landed with tsshd#7) and waits for the row-3(b)
+campaign's committed artifacts; `post-shed-settle` and
+`raw-pty-byte-integrity-shed` wait for tsshd#8. `TSSHD_CTRL_GATE` only
 reports these contracts—it cannot activate them. This prevents a placeholder
 or absent capability from producing a green gate.
 

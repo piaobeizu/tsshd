@@ -944,6 +944,13 @@ type ctrlCase struct {
 	// gate tests the downlink recipe and requires the downlink to actually
 	// receive its budgeted share of the shared queue.
 	UplinkSourceBPS int64
+
+	// MeasureAck (row 3(b), tsshd#7) negotiates the input-ACCEPTED ack on
+	// the harness client and measures, per Ctrl-C sample, the arrival of a
+	// covering ack next to the child's post-SIGINT marker. Only the
+	// ack_* cases set it: every other case's stimulus must stay
+	// byte-identical to its committed baseline (no ack traffic).
+	MeasureAck bool
 }
 
 // ctrlExpect is the anticipated outcome of a case; it turns documented
@@ -1223,6 +1230,20 @@ func init() {
 		c.WaitTimeout = 180 * time.Second
 		return c
 	}
+	// Row 3(b) (tsshd#7): the paired-event gate case. Identical stimulus
+	// and netem to input_bottleneck_shared (the unmitigated shared
+	// bottleneck, P1 off), with the input-ACCEPTED ack negotiated and
+	// measured: each sample records the covering ack's arrival (the §4.5
+	// coverage rule) next to the child's post-SIGINT marker. A dedicated
+	// case keeps rows 1/2's committed stimulus byte-identical (no ack
+	// traffic on their baselines); activating the gate is the reviewed
+	// inventory change (budget_gate_test row-3b).
+	ctrlCases["ack_bottleneck_shared"] = func() ctrlCase {
+		c := ctrlCases["input_bottleneck_shared"]()
+		c.Netem.Name = "ack_bottleneck_shared"
+		c.MeasureAck = true
+		return c
+	}
 	// Matched-stimulus P1-off references for the row-5 controlled comparison
 	// (review finding: the p1 bulk variants bound the uplink source, so the
 	// P1-off side needs the same stimulus to attribute the difference to the
@@ -1410,6 +1431,12 @@ type ctrlResult struct {
 	DiscardEnd      uint64   `json:"discard_end,omitempty"`
 	SettledMs       *float64 `json:"settled_ms,omitempty"`
 
+	// Row 3(b) (tsshd#7): the ack traffic the case generated on the bus
+	// stream (events and their wire bytes), so the < 1% ack-traffic budget
+	// is citable from the artifact itself.
+	AckEvents    int    `json:"ack_events,omitempty"`
+	AckWireBytes uint64 `json:"ack_wire_bytes,omitempty"`
+
 	GoodputWindowStartNS    int64   `json:"goodput_window_start_ns,omitempty"`
 	GoodputWindowEndNS      int64   `json:"goodput_window_end_ns,omitempty"`
 	GoodputBytes            uint64  `json:"goodput_bytes,omitempty"`
@@ -1444,10 +1471,100 @@ type ctrlResult struct {
 	bulkInput10Seen  bool
 	bulkInputEndSeen bool
 
+	// Row 3(b) bookkeeping: the ack tracker (nil unless MeasureAck).
+	ackTracker *ctrlAckTracker
+
 	Relay            ctrlRelayStats    `json:"relay"`
 	Budget           ctrlBudgetMetrics `json:"budget"`
 	QLenUpAtInject   *int              `json:"qlen_up_pkts_at_inject"`
 	QLenDownAtInject *int              `json:"qlen_down_pkts_at_inject"`
+}
+
+// ---------------------------------------------------------------------------
+// row 3(b): the input-ack tracker (tsshd#7)
+// ---------------------------------------------------------------------------
+
+// ctrlAckDelivery is one completed sample: the covering ack arrived at
+// deliveryNS for the control injected at injectNS.
+type ctrlAckDelivery struct {
+	injectNS   int64
+	deliveryNS int64
+}
+
+// ctrlAckTracker measures row 3(b)'s paired events: for each Ctrl-C sample
+// it snapshots the client-side coverage coordinates once the byte was
+// handed to the transport, and records when the coverage rule
+// (appliedBytes >= R - D, §4.5) first marks that snapshot delivered. The
+// per-sample ack delay is deliveryNS - injectNS; markerMs in the same
+// sample is the paired drain event.
+type ctrlAckTracker struct {
+	mu       sync.Mutex
+	sess     *SshUdpSession
+	snap     InputAckSnapshot
+	injectNS int64
+	events   int
+	wire     uint64
+	seen     []ctrlAckDelivery
+}
+
+// onAck records one ack event and checks delivery of the pending sample.
+// Runs on the client's callback goroutine.
+func (tr *ctrlAckTracker) onAck(ack InputAckInfo) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.events++
+	if buf, err := json.Marshal(&inputAckMessage{
+		SessionID: ack.SessionID, Epoch: ack.Epoch,
+		AppliedBytes: ack.AppliedBytes, WriteMS: ack.WriteMS,
+	}); err == nil {
+		// The wire size of one inputAck event: command + length + payload
+		// (buildOrderedEvent's exact framing).
+		tr.wire += uint64(1 + len("inputAck") + 4 + len(buf))
+	}
+	if tr.sess == nil || tr.injectNS == 0 {
+		return
+	}
+	if tr.sess.InputDelivered(tr.snap) {
+		tr.seen = append(tr.seen, ctrlAckDelivery{tr.injectNS, ctrlMonoNS()})
+		tr.injectNS = 0
+	}
+}
+
+// beginSample arms the tracker for the control injected at t0: the
+// client's forwardInput counts R at transport-write completion, so poll
+// (bounded) until the Ctrl-C byte is included in the offset, then hold the
+// snapshot. A previous undelivered sample is simply superseded - a late ack
+// covering the old, smaller offset cannot deliver the new, larger one.
+func (tr *ctrlAckTracker) beginSample(t0 int64) {
+	tr.mu.Lock()
+	sess := tr.sess
+	tr.mu.Unlock()
+	if sess == nil {
+		return
+	}
+	before := sess.InputAckSnapshot()
+	deadline := time.Now().Add(2 * time.Second)
+	var snap InputAckSnapshot
+	for {
+		snap = sess.InputAckSnapshot()
+		if snap.Offset > before.Offset {
+			break
+		}
+		if time.Now().After(deadline) {
+			return // never delivered to the transport: no ack can cover it
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	tr.mu.Lock()
+	tr.snap, tr.injectNS = snap, t0
+	tr.mu.Unlock()
+}
+
+// deliver copies the tracker's findings out (post-processing).
+func (tr *ctrlAckTracker) deliver() (events int, wire uint64, seen []ctrlAckDelivery) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.events, tr.wire, append([]ctrlAckDelivery(nil), tr.seen...)
 }
 
 // ---------------------------------------------------------------------------
@@ -1734,7 +1851,7 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 	var discardStats struct {
 		lines, outBytes atomic.Uint64
 	}
-	client, err := NewSshUdpClient(&UdpClientOptions{
+	clientOpts := &UdpClientOptions{
 		ServerInfo:       info,
 		TsshdAddr:        relay.addr().String(),
 		SessionName:      "ctrlbench",
@@ -1746,12 +1863,32 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 			discardStats.lines.Add(lines)
 			discardStats.outBytes.Add(outBytes)
 		},
-	})
+	}
+	if cfg.MeasureAck {
+		// Row 3(b) (tsshd#7): negotiate the input-ACCEPTED ack and track
+		// each sample's covering ack. The tracker must exist before the
+		// client (the callback closes over it).
+		res.ackTracker = &ctrlAckTracker{}
+		clientOpts.OnInputAck = func(_ *SshUdpClient, ack InputAckInfo) {
+			res.ackTracker.onAck(ack)
+		}
+	}
+	client, err := NewSshUdpClient(clientOpts)
 	if err != nil {
 		res.Failure = fmt.Sprintf("NewSshUdpClient failed: %v", err)
 		return res
 	}
 	defer func() { _ = client.Close() }()
+
+	if cfg.MeasureAck {
+		// Advertise the capability BEFORE any session starts, so the eager
+		// epoch on the start response is in place for the first sample
+		// (tsshd#7 §4.5).
+		if err := client.SetInputAck(true); err != nil {
+			res.Failure = fmt.Sprintf("SetInputAck failed: %v", err)
+			return res
+		}
+	}
 
 	timeoutSeen := make(chan int64, 1)
 	reconnectedSeen := make(chan int64, 1)
@@ -1778,6 +1915,12 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 		return res
 	}
 	defer func() { _ = session.Close() }()
+
+	if cfg.MeasureAck {
+		res.ackTracker.mu.Lock()
+		res.ackTracker.sess = session
+		res.ackTracker.mu.Unlock()
+	}
 
 	if err := session.RequestPty("xterm-256color", 50, 200, ssh.TerminalModes{}); err != nil {
 		res.Failure = fmt.Sprintf("RequestPty failed: %v", err)
@@ -2204,6 +2347,26 @@ func ctrlRunCase(t *testing.T, cfg ctrlCase) *ctrlResult {
 				res.ConfirmationP50Ms, res.ConfirmationP95Ms = &p50, &p95
 			}
 		}
+
+		// Row 3(b) (tsshd#7): fill each sample's covering-ack delay from the
+		// tracker, and record the case's ack traffic for the < 1% budget.
+		if cfg.MeasureAck && res.ackTracker != nil {
+			events, wire, deliveries := res.ackTracker.deliver()
+			res.AckEvents, res.AckWireBytes = events, wire
+			byInject := make(map[int64]int64, len(deliveries))
+			for _, d := range deliveries {
+				byInject[d.injectNS] = d.deliveryNS
+			}
+			for i := range res.Samples {
+				if res.Samples[i].InjectMonoNS == 0 {
+					continue
+				}
+				if dn, ok := byInject[res.Samples[i].InjectMonoNS]; ok {
+					v := float64(dn-res.Samples[i].InjectMonoNS) / 1e6
+					res.Samples[i].AckMs = &v
+				}
+			}
+		}
 	}
 
 	countMode := cfg.ChildMode == "ctrlcount" || cfg.ChildMode == "floodcount" || cfg.ChildMode == "floodreadcount"
@@ -2510,6 +2673,12 @@ func ctrlRunCountCase(cfg ctrlCase, res *ctrlResult, events <-chan ctrlEvent,
 		if _, err := stdin.Write([]byte{0x03}); err != nil {
 			res.Failure = fmt.Sprintf("ctrl-c write failed: %v", err)
 			return
+		}
+		if cfg.MeasureAck {
+			// Arm the tracker after the write: it polls until the byte is in
+			// the client's sent offset, then waits for a covering ack
+			// (tsshd#7 §4.5 coverage rule).
+			res.ackTracker.beginSample(t0)
 		}
 		qlen, _ := relay.qlenSnapshot()
 		timeout := time.After(patience)
@@ -2851,6 +3020,28 @@ func ctrlApplyCurrentGates(res *ctrlResult) {
 		if res.ContinuityGapBytes > 30720*110/100 && res.Failure == "" {
 			res.Failure = fmt.Sprintf("attach continuity gap %dB exceeds [committed-v2] 30720B +10%% (%dB); the pending-output policy lost more of the detach window than the committed baseline (tracked by tsshd#11)",
 				res.ContinuityGapBytes, 30720*110/100)
+		}
+	}
+	// Row 3(b) (tsshd#7): the paired-event gate on the unmitigated shared
+	// bottleneck (P1 off). A paired win = ackDelay < markerDelay against the
+	// child's post-SIGINT marker (the harness-recognized first post-interrupt
+	// output); ack absent → counted in the loss rate, never a win; marker
+	// absent within the existing observation patience → win, noted; tie →
+	// not a win; NO absolute latency bound is claimed (design §7 row 3(b)).
+	// The gate also enforces the delivered-ack coverage floor and the ack
+	// traffic budget (< 1% of the stream's payload bytes).
+	if res.Case == "ack_bottleneck_shared" {
+		wins, covered := ctrlGateAckPaired(res.Samples)
+		if covered < 20 && res.Failure == "" {
+			res.Failure = fmt.Sprintf("row-3(b) delivered-ack coverage %d of %d attempts < 20 per run",
+				covered, len(res.Samples))
+		} else if covered > 0 && float64(wins)/float64(covered) < 0.90 && res.Failure == "" {
+			res.Failure = fmt.Sprintf("row-3(b) paired-win rate %.1f%% (%d/%d delivered) < 90%%",
+				100*float64(wins)/float64(covered), wins, covered)
+		}
+		if res.Budget.ClientPayloadBytes > 0 && res.AckWireBytes*100 >= res.Budget.ClientPayloadBytes && res.Failure == "" {
+			res.Failure = fmt.Sprintf("row-3(b) ack traffic %dB >= 1%% of stream payload %dB",
+				res.AckWireBytes, res.Budget.ClientPayloadBytes)
 		}
 	}
 	// ---- tsshd#6 P1-on gates: server output pacing at the recipe (p1_ prefix) ----

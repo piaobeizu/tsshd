@@ -258,15 +258,95 @@ type udpReadyMessage struct {
 }
 
 type discardMessage struct {
+	// Legacy fields (unchanged wire behavior for old clients).
 	DiscardMarker        []byte `json:",omitempty"`
 	DiscardedInput       []byte `json:",omitempty"`
 	DiscardedOutputLines uint64 `json:",omitempty"`
 	DiscardedOutputBytes uint64 `json:",omitempty"`
+
+	// Classified extension (tsshd#7, design doc §4.5): kind-classified,
+	// epoch-attributed input-discard reports. Emitted only to
+	// InputAck-negotiating clients, through the ordered bus sender;
+	// classified reports carry COUNTS, never the discarded byte payload,
+	// so every event stays a single smux frame (see orderedBusSender).
+	Kind string `json:",omitempty"`
+	// SessionID attributes the report to one session (one connection
+	// carries multiple sessions).
+	SessionID uint64 `json:",omitempty"`
+	// Epoch is the epoch the report's discarded bytes are attributed to
+	// (the epoch the boundary CLOSED - the pre-marker epoch - for
+	// inputDiscardCompleted; the new epoch for inputBoundary).
+	Epoch uint64 `json:",omitempty"`
+	// DiscardedInputBytes is the non-marker count of the discarded input
+	// prefix (the classified counterpart of the legacy DiscardedInput
+	// bytes).
+	DiscardedInputBytes uint64 `json:",omitempty"`
+	// OutputStart/OutputEnd is the half-open [start, end) byte range of
+	// the session's stdout output stream source coordinates shed by a
+	// client-requested disposal (session-lifetime; populated by tsshd#8).
+	OutputStart uint64 `json:",omitempty"`
+	OutputEnd   uint64 `json:",omitempty"`
+	// RequestInputOffset echoes the applied-coordinate offset of a shed
+	// request; ShedStatus reports its admission (rejected/expired).
+	RequestInputOffset uint64 `json:",omitempty"`
+	ShedStatus         string `json:",omitempty"`
+	// InFlightBytes is the writer-owned handoff backlog at report time
+	// (the R7-W1 definition; see serverOutputForwarder.inFlightBytes).
+	InFlightBytes uint64 `json:",omitempty"`
 }
+
+// Discard report kinds (design doc §4.5): only inputBoundary creates an
+// epoch boundary and resets client R/D; completion/status/output reports
+// never reset anything.
+const (
+	kDiscardKindInputBoundary  = "inputBoundary"
+	kDiscardKindInputCompleted = "inputDiscardCompleted"
+	kDiscardKindOutputShed     = "outputShed"
+	kDiscardKindRequestStatus  = "requestStatus"
+)
+
+// ShedStatus values for discard reports carrying a request echo
+// (tsshd#8's admission outcomes; the vocabulary lands with the schema).
+const (
+	kShedStatusRejected = "rejected"
+	kShedStatusExpired  = "expired"
+)
 
 type settingsMessage struct {
 	KeepPendingInput  *bool `json:",omitempty"`
 	KeepPendingOutput *bool `json:",omitempty"`
+	// InputAck is the client's capability advertisement for the
+	// input-ACCEPTED ack (tsshd#7): when true, the server emits input_ack
+	// events and kind-classified discard reports on the bus stream. Old
+	// servers ignore the unknown field; old clients never send it.
+	InputAck *bool `json:",omitempty"`
+}
+
+// inputAckMessage is the server's "inputAck" bus event: the ordered count
+// of non-marker input bytes of one session within one epoch that have been
+// accepted by the PTY - writeAll returned on every server input write path
+// (the normal forwardInput loop AND discardPendingInput's surviving-suffix
+// write). "Accepted", never "application-handled". Acks are advisory: loss
+// renders "no confirmation" and never stalls forwardInput.
+type inputAckMessage struct {
+	SessionID    uint64 `json:",omitempty"`
+	Epoch        uint64 `json:",omitempty"`
+	AppliedBytes uint64 `json:",omitempty"`
+	WriteMS      int64  `json:",omitempty"`
+}
+
+// startResponse is the session-start/attach success response: the legacy
+// errorMessage shape plus the additive Epoch field, the eager channel of
+// the input-ack coordinate contract (design doc §4.5). Old clients parse it
+// as errorMessage and ignore the extra field; an old server sends no Epoch,
+// which a new client reads as "feature unsupported".
+type startResponse struct {
+	errorMessage
+	Epoch uint64 `json:",omitempty"`
+}
+
+func (d *startResponse) getErrorMessage() *errorMessage {
+	return &d.errorMessage
 }
 
 type errorResponder interface {

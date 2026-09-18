@@ -389,7 +389,25 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 		return nil, 0, fmt.Errorf("invalid session state: err stream is nil")
 	}
 
-	if err := sendSuccess(ioStream); err != nil { // ack ok
+	// Attach is a matched input boundary (tsshd#7, R7-B4): the success
+	// response below carries the new epoch, and the attaching client
+	// starts at the input origin by construction - both sides reset
+	// together, so coverage stays closed without any client-local
+	// reset. The previous client's pending discard window is dead (its
+	// bytes were never applied and will never be reported): release the
+	// reserved completion slot and drop the accumulation.
+	sess.inputStateMu.Lock()
+	sess.releasePendingDiscardLocked()
+	sess.inputAppliedPrev = sess.inputApplied
+	sess.inputApplied = inputEpochCounter{epoch: sess.inputApplied.epoch + 1}
+	epoch := sess.inputApplied.epoch
+	sess.pendingDiscardEpoch = 0
+	sess.discardedInput = nil
+	sess.discardMarker.Store(nil)
+	sess.inputRefused = false
+	sess.inputStateMu.Unlock()
+
+	if err := sendResponse(ioStream, &startResponse{Epoch: epoch}); err != nil { // ack ok
 		return nil, 0, fmt.Errorf("ack ok failed: %v", err)
 	}
 
@@ -458,6 +476,15 @@ func (s *sshUdpServer) detachAllSessions(oldServer *sshUdpServer) {
 			sess.ioStream.swap(nil)
 		}
 		sess.discardMarker.Store(nil)
+		// The detaching client's pending input-discard window is dead
+		// (never applied, never reported): release its reserved report slot
+		// and drop the accumulation instead of leaking it in session
+		// memory. An attaching client later re-establishes a matched
+		// boundary with its own epoch (tsshd#7).
+		sess.inputStateMu.Lock()
+		sess.releasePendingDiscardLocked()
+		sess.discardedInput = nil
+		sess.inputStateMu.Unlock()
 		sess.server.Store(nil)
 
 		sess.waitMutex.Lock()

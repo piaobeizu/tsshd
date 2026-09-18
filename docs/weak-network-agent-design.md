@@ -573,6 +573,56 @@ field in the existing session-start success response** (an additive field in
 an existing message, not a new handshake message). No changes to the
 data-stream protocol's framing or the reconnect protocol's flow.
 
+### §4.6 Round-8 reconciliations (recorded at tsshd#7 implementation; the
+round-7 open items closed against the real tree)
+
+The four round-7 blocking/warning contracts are closed as follows, binding
+for the implementing PRs:
+
+* **R7-B4 (epoch attribution + recovery origin)** — a completion report's
+  `epoch` is the epoch the boundary CLOSED (the pre-marker epoch), NOT the
+  receipt epoch: bytes arriving after installation but before the client
+  injects the delimiter are attributed to the closed epoch, where the
+  client counted them in R. A client already in the newer epoch ignores the
+  stale-epoch D update entirely. Recovery requires a **server-assigned
+  matched boundary** — a session-start/attach success carrying an epoch, or
+  a `kind=inputBoundary` report; a mere transport reconnect (including
+  `KeepPendingInput` roaming, which installs no marker) continues BOTH
+  sides' coordinates in the same epoch, and the client NEVER resets R/D
+  locally. `outputShed`/`requestStatus` never touch input coordinates.
+* **R7-B3 (reservation lifecycle)** — marker installation reserves BOTH
+  report slots (boundary + completion) before any state change; empty
+  prefixes release the completion slot without emitting; a re-install
+  supersedes (releases the stale completion slot, folds the accumulation),
+  bounding per-session occupancy at 2 entries; detach releases; at the cap
+  (256 outstanding) the marker is NOT installed and the session refuses
+  input until a boundary is established (legacy connections keep the
+  unconditional install; the degradation variant stays removed).
+* **R7-W1 (`inFlightBytes`)** — defined as the **writer-owned handoff
+  backlog**: bytes in buffers already accepted into the stdout forwarder's
+  `writeBufCh` plus the unwritten remainder of the buffer `writerLoop` is
+  currently writing. It excludes cached-pending lines (reported by the
+  discard counters), kcp send-queue bytes and kernel/PTY buffers. The value
+  is measured (not modeled), asserted directly in unit tests, and required
+  in row-4/row-8-shed gate artifacts.
+* **R7-B1 (executor wakeup; the input-side share)** — the input path and
+  the bus handler never wait on the output drain; the ordered sender's
+  handoff is durable by construction (append under the sender mutex, then
+  a buffered wake the idle sender re-checks). The contract handed to
+  tsshd#8 for its own executor: hand off under the mutex the idle-check
+  reads, or carry a durable pending flag re-checked after every wake —
+  checkpoint+TryLock alone is insufficient (publication can occur between
+  the final checkpoint and unlock, and `waitUntilReconnected` holds
+  `handleMutex` with no checkpoints).
+
+Implementation note: ordered events are single smux frames — smux v2
+`Write` splits payloads across frames through the session-wide shaper, so
+concurrent multi-frame writes can interleave; classified reports therefore
+carry counts, never the discarded byte payload (the legacy byte-payload
+message keeps its legacy path), and non-coordinate bus messages keep the
+direct send path (semantically inert interleaving; the heartbeat RTT stays
+free of FIFO queueing delay).
+
 ---
 
 ## 5. Exact ownership map
