@@ -151,10 +151,16 @@ type serverOutputForwarder struct {
 	stream Stream
 
 	handleMutex sync.Mutex
-	returned    bool
-	writeError  atomic.Bool
-	done        chan struct{}
-	writeBufCh  chan []byte
+	// processing serializes cache/queue mutations while allowing the mutex to
+	// be released during a blocked transport send or reconnect wait. Other
+	// handlers wait for the current owner without holding handleMutex.
+	processing       bool
+	processDone      chan struct{}
+	reconnectPending bool
+	returned         bool
+	writeError       atomic.Bool
+	done             chan struct{}
+	writeBufCh       chan []byte
 
 	cacheLines       [][]byte
 	tmuxOutputPrefix string
@@ -174,6 +180,56 @@ type serverOutputForwarder struct {
 
 	discardOutput atomic.Bool
 	discardMarker atomic.Pointer[[]byte]
+}
+
+func (f *serverOutputForwarder) beginProcessing() {
+	f.handleMutex.Lock()
+	for f.processing {
+		done := f.processDone
+		f.handleMutex.Unlock()
+		<-done
+		f.handleMutex.Lock()
+	}
+	f.processing = true
+	f.processDone = make(chan struct{})
+}
+
+// endProcessing is called with handleMutex held by the processing owner.
+func (f *serverOutputForwarder) endProcessing() {
+	// A reconnect can race with a handler that cached the final output chunk.
+	// Defer the replay until that handler finishes, rather than dropping the
+	// notification or sending its cache ahead of the chunk it still owns.
+	for f.reconnectPending && !f.returned {
+		f.reconnectPending = false
+		f.flushOutput()
+	}
+	f.processing = false
+	close(f.processDone)
+	f.handleMutex.Unlock()
+}
+
+// waitForQueue releases only the state mutex. The processing token remains
+// held, so reconnect cannot replay cached lines ahead of the pending write.
+func (f *serverOutputForwarder) waitForQueue() {
+	f.handleMutex.Unlock()
+	time.Sleep(10 * time.Millisecond)
+	f.handleMutex.Lock()
+}
+
+// enqueueWhileDisconnected is used for the old timeout path, which can wait
+// for stream capacity. A failed writer cannot consume this queue again.
+func (f *serverOutputForwarder) enqueueWhileDisconnected(buf []byte) bool {
+	for {
+		select {
+		case f.writeBufCh <- buf:
+			return true
+		default:
+			if f.returned || f.writeError.Load() {
+				return false
+			}
+			f.waitForQueue()
+		}
+	}
 }
 
 func (f *serverOutputForwarder) writerLoop() {
@@ -304,10 +360,10 @@ func (f *serverOutputForwarder) flushOutput() {
 					}
 					return
 				}
-				if f.writeError.Load() {
+				if f.returned || f.writeError.Load() {
 					return
 				}
-				time.Sleep(10 * time.Millisecond)
+				f.waitForQueue()
 			}
 		}
 	}
@@ -337,18 +393,27 @@ func (f *serverOutputForwarder) clearOutput() {
 
 func (f *serverOutputForwarder) onReconnected() {
 	f.handleMutex.Lock()
-	defer f.handleMutex.Unlock()
-
+	// The active handler observes the updated checker itself. A second flush
+	// while it is processing would duplicate or reorder its cached output.
 	if f.returned {
-		return // do not flush after forwardoutput has returned
+		f.handleMutex.Unlock()
+		return
 	}
+	if f.processing {
+		f.reconnectPending = true
+		f.handleMutex.Unlock()
+		return
+	}
+	f.processing = true
+	f.processDone = make(chan struct{})
+	defer f.endProcessing()
 
 	f.flushOutput()
 }
 
 func (f *serverOutputForwarder) handleBuffer(buf []byte) {
-	f.handleMutex.Lock()
-	defer f.handleMutex.Unlock()
+	f.beginProcessing()
+	defer f.endProcessing()
 
 	// The client requested discarding all previous output.
 	// Clear any cached output on the server side and echo the marker
@@ -410,7 +475,10 @@ out:
 		default:
 			if f.sess.clientChecker.isTimeout() {
 				if f.sess.isKeepPendingOutput() {
-					if f.sess.clientChecker.waitUntilReconnected() != nil {
+					f.handleMutex.Unlock()
+					err := f.sess.clientChecker.waitUntilReconnected()
+					f.handleMutex.Lock()
+					if err != nil {
 						return
 					}
 					continue
@@ -422,15 +490,21 @@ out:
 				}
 				pos := bytes.IndexByte(buf, '\n')
 				if pos < 0 && f.noNewLineCount < 3 {
-					f.writeBufCh <- buf
+					if !f.enqueueWhileDisconnected(buf) {
+						return
+					}
 					f.noNewLineCount++
 					break out
 				}
 
 				if pos < 0 {
-					f.writeBufCh <- buf
+					if !f.enqueueWhileDisconnected(buf) {
+						return
+					}
 				} else {
-					f.writeBufCh <- buf[:pos+1]
+					if !f.enqueueWhileDisconnected(buf[:pos+1]) {
+						return
+					}
 					left := buf[pos+1:]
 					if len(left) > 0 {
 						f.cacheOutput(left)
@@ -440,10 +514,10 @@ out:
 				f.chHasNewLine = true
 				break out
 			}
-			if f.writeError.Load() {
+			if f.returned || f.writeError.Load() {
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			f.waitForQueue()
 		}
 	}
 
@@ -453,12 +527,15 @@ out:
 }
 
 func (f *serverOutputForwarder) handleError() {
-	f.handleMutex.Lock()
-	defer f.handleMutex.Unlock()
+	f.beginProcessing()
+	defer f.endProcessing()
 
 	for len(f.cacheLines) > 0 && !f.writeError.Load() {
 		if f.sess.clientChecker.isTimeout() {
-			if f.sess.clientChecker.waitUntilReconnected() != nil {
+			f.handleMutex.Unlock()
+			err := f.sess.clientChecker.waitUntilReconnected()
+			f.handleMutex.Lock()
+			if err != nil {
 				break
 			}
 		}
@@ -470,6 +547,12 @@ func (f *serverOutputForwarder) forward() {
 	defer func() {
 		f.handleMutex.Lock()
 		f.returned = true
+		for f.processing {
+			done := f.processDone
+			f.handleMutex.Unlock()
+			<-done
+			f.handleMutex.Lock()
+		}
 		close(f.writeBufCh)
 		f.handleMutex.Unlock()
 		<-f.done
