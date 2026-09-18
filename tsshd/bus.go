@@ -81,6 +81,13 @@ func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
 	}
 
 	s.busStream = stream
+
+	// The ordered sender owns the bus writes of every ordering-sensitive
+	// event (input_ack, classified discard reports) for this connection
+	// (tsshd#7). Emission stays gated on the InputAck setting; the sender
+	// exists regardless so a mid-connection negotiation finds it ready.
+	s.orderedSender = newOrderedBusSender(stream)
+	go s.orderedSender.run()
 	return nil
 }
 
@@ -284,6 +291,14 @@ func (s *sshUdpServer) handleSettingEvent(stream Stream) error {
 	}
 	if msg.KeepPendingOutput != nil {
 		s.keepPendingOutput.Store(*msg.KeepPendingOutput)
+	}
+	if msg.InputAck != nil {
+		// Capability negotiation (tsshd#7): emission of input_ack events
+		// and classified discard reports is gated on this flag. An old
+		// client never sends it; an old server ignores it (unknown JSON
+		// field) and never emits.
+		s.inputAck.Store(*msg.InputAck)
+		debug("client [%x] input ack %v", s.client.proxyAddr.clientID, *msg.InputAck)
 	}
 	return nil
 }

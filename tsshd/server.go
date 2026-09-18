@@ -66,6 +66,14 @@ type sshUdpServer struct {
 	keepPendingInput  atomic.Bool
 	keepPendingOutput atomic.Bool
 
+	// input-ack (tsshd#7): inputAck is the connection's negotiated
+	// capability (set by the client's "setting" command); orderedSender is
+	// the ONE per-connection goroutine that alone writes the
+	// ordering-sensitive bus events (input_ack and the classified discard
+	// reports) once the bus stream is initialized.
+	inputAck      atomic.Bool
+	orderedSender *orderedBusSender
+
 	// TCP forwarding
 	nextFwdAcceptID atomic.Uint64
 	fwdAcceptMutex  sync.Mutex
@@ -276,6 +284,12 @@ func (s *sshUdpServer) Close() {
 
 	// Stop the client checker and its background goroutines.
 	s.clientChecker.Close()
+
+	// Stop the ordered bus sender; its FIFO's remaining events die with
+	// the connection.
+	if s.orderedSender != nil {
+		s.orderedSender.stop()
+	}
 
 	// Best-effort shutdown of the bus stream.
 	//

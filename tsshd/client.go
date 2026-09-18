@@ -94,6 +94,10 @@ type SshUdpClient struct {
 	maxHeartbeatCnt  atomic.Uint64
 	needLogHeartbeat atomic.Bool
 	keepPendingInput atomic.Bool
+	// input-ack (tsshd#7)
+	inputAckEnabled atomic.Bool
+	onInputAck      func(*SshUdpClient, InputAckInfo)
+	onInputReport   func(*SshUdpClient, InputReportInfo)
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
@@ -115,7 +119,19 @@ type UdpClientOptions struct {
 	RttCallback      func(rtt int64)
 	QuitCallback     func(reason string)
 	DiscardCallback  func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
-	ProxyCommand     string
+	// OnInputAck fires for every input-ACCEPTED ack the server emits
+	// (tsshd#7), asynchronously AFTER the client's ack state has been
+	// updated synchronously in bus dispatch order. The callback decides
+	// what to render; nothing is ever added to the forwarded stream.
+	OnInputAck func(client *SshUdpClient, ack InputAckInfo)
+	// OnInputReport fires for every kind-classified discard report
+	// (inputBoundary / inputDiscardCompleted / outputShed /
+	// requestStatus), asynchronously after the state update, carrying the
+	// full classified fields (epoch, counts, ranges, ShedStatus,
+	// inFlightBytes). The legacy DiscardCallback above keeps firing with
+	// the legacy fields exactly as before.
+	OnInputReport func(client *SshUdpClient, report InputReportInfo)
+	ProxyCommand  string
 }
 
 // NewSshUdpClient creates a SshUdpClient
@@ -144,6 +160,8 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		rttCallback:     opts.RttCallback,
 		quitCallback:    opts.QuitCallback,
 		discardCallback: opts.DiscardCallback,
+		onInputAck:      opts.OnInputAck,
+		onInputReport:   opts.OnInputReport,
 		enableDebugging: opts.EnableDebugging,
 		clientDebugFunc: opts.DebugFunc,
 		enableWarning:   opts.EnableWarning,
@@ -623,6 +641,16 @@ func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingInput: &keep})
 }
 
+// SetInputAck advertises (or withdraws) the input-ACCEPTED ack capability
+// (tsshd#7). While enabled, the server emits inputAck bus events and
+// kind-classified discard reports for this connection. An old server
+// ignores the setting (no acks arrive - the client renders nothing); a
+// client that never calls this stays on the fully legacy path.
+func (c *SshUdpClient) SetInputAck(enable bool) error {
+	c.inputAckEnabled.Store(enable)
+	return c.sendBusMessage("setting", settingsMessage{InputAck: &enable})
+}
+
 // SetKeepPendingOutput sets whether to keep the pending output during disconnection.
 func (c *SshUdpClient) SetKeepPendingOutput(keep bool) error {
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingOutput: &keep})
@@ -875,6 +903,8 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.handleAliveEvent()
 		case "discard":
 			c.handleDiscardEvent()
+		case "inputAck":
+			c.handleInputAckEvent()
 		case "rekey":
 			c.handleRekeyEvent()
 		case "detachAck":
@@ -1001,6 +1031,42 @@ func (c *SshUdpClient) handleDiscardEvent() {
 		return
 	}
 
+	// Classified reports (tsshd#7): the ack state updates SYNCHRONOUSLY
+	// here, in bus dispatch order. Only inputBoundary resets R/D and
+	// adopts the epoch (a server-assigned matched boundary); completion
+	// reports add D for their epoch; output-shed and request-status
+	// reports never touch input coordinates (R7-B4).
+	if msg.Kind != "" {
+		if msg.SessionID != 0 {
+			c.sessionMutex.Lock()
+			sess := c.sessionMap[msg.SessionID]
+			c.sessionMutex.Unlock()
+			if sess != nil {
+				switch msg.Kind {
+				case kDiscardKindInputBoundary:
+					sess.ackState.adoptBoundary(msg.Epoch)
+				case kDiscardKindInputCompleted:
+					sess.ackState.addDiscarded(msg.Epoch, msg.DiscardedInputBytes)
+				}
+			}
+		}
+		if c.onInputReport != nil {
+			go c.onInputReport(c, InputReportInfo{
+				Kind:                 msg.Kind,
+				SessionID:            msg.SessionID,
+				Epoch:                msg.Epoch,
+				DiscardedInputBytes:  msg.DiscardedInputBytes,
+				DiscardedOutputLines: msg.DiscardedOutputLines,
+				DiscardedOutputBytes: msg.DiscardedOutputBytes,
+				OutputStart:          msg.OutputStart,
+				OutputEnd:            msg.OutputEnd,
+				RequestInputOffset:   msg.RequestInputOffset,
+				ShedStatus:           msg.ShedStatus,
+				InFlightBytes:        msg.InFlightBytes,
+			})
+		}
+	}
+
 	if c.discardCallback != nil && (len(msg.DiscardedInput) > 0 || msg.DiscardedOutputLines > 0 || msg.DiscardedOutputBytes > 0) {
 		go c.discardCallback(msg.DiscardedInput, msg.DiscardedOutputLines, msg.DiscardedOutputBytes)
 	}
@@ -1008,9 +1074,47 @@ func (c *SshUdpClient) handleDiscardEvent() {
 	if len(msg.DiscardMarker) > 0 {
 		c.sessionMutex.Lock()
 		defer c.sessionMutex.Unlock()
+		if msg.Kind == kDiscardKindInputBoundary && msg.SessionID != 0 {
+			// A classified boundary report points its marker at one session.
+			if sess := c.sessionMap[msg.SessionID]; sess != nil {
+				sess.inputMarker.Store(&msg.DiscardMarker)
+			}
+			return
+		}
+		// Legacy (unclassified) marker announcement: today's broadcast to
+		// every session, byte-identical to the pre-ack behavior.
 		for _, sess := range c.sessionMap {
 			sess.inputMarker.Store(&msg.DiscardMarker)
 		}
+	}
+}
+
+// handleInputAckEvent consumes one input-ACCEPTED ack: the session's
+// state updates synchronously here (dispatch order), and the OnInputAck
+// callback fires asynchronously after the state update (design §4.5
+// client rule: bus dispatch updates D/R state synchronously; UI callbacks
+// are invoked asynchronously only AFTER the state update).
+func (c *SshUdpClient) handleInputAckEvent() {
+	var msg inputAckMessage
+	if err := recvMessage(c.busStream, &msg); err != nil {
+		c.warning("recv input ack message failed: %v", err)
+		return
+	}
+
+	c.sessionMutex.Lock()
+	sess := c.sessionMap[msg.SessionID]
+	c.sessionMutex.Unlock()
+	if sess != nil {
+		sess.ackState.observeAck(msg.Epoch, msg.AppliedBytes)
+	}
+
+	if c.onInputAck != nil {
+		go c.onInputAck(c, InputAckInfo{
+			SessionID:    msg.SessionID,
+			Epoch:        msg.Epoch,
+			AppliedBytes: msg.AppliedBytes,
+			WriteMS:      msg.WriteMS,
+		})
 	}
 }
 
@@ -1027,6 +1131,131 @@ func (c *SshUdpClient) handleRekeyEvent() {
 			return
 		}
 	}
+}
+
+// InputAckInfo carries one input-ACCEPTED ack event (tsshd#7) to
+// OnInputAck: the ordered count of non-marker input bytes of one session
+// within one epoch that the server's PTY has accepted (writeAll returned
+// on every input write path). "Accepted", never "application-handled".
+type InputAckInfo struct {
+	SessionID    uint64
+	Epoch        uint64
+	AppliedBytes uint64
+	WriteMS      int64
+}
+
+// InputAckSnapshot captures a control's coverage coordinates at the
+// moment the control was sent. InputDelivered can only ever confirm a
+// snapshot taken in the epoch it was captured in - an offset from a
+// superseded epoch never confirms (R7-B4).
+type InputAckSnapshot struct {
+	Supported bool
+	Epoch     uint64
+	Offset    uint64
+}
+
+// InputReportInfo mirrors the kind-classified discard report fields for
+// OnInputReport.
+type InputReportInfo struct {
+	Kind                 string
+	SessionID            uint64
+	Epoch                uint64
+	DiscardedInputBytes  uint64
+	DiscardedOutputLines uint64
+	DiscardedOutputBytes uint64
+	OutputStart          uint64
+	OutputEnd            uint64
+	RequestInputOffset   uint64
+	ShedStatus           string
+	InFlightBytes        uint64
+}
+
+// sessionAckState is one session's input-ack coordinate state (tsshd#7):
+// the client-side half of the applied-coordinate contract. Guarded by its
+// own mutex because the bus dispatch goroutine updates it while the
+// session's forwardInput counts sent bytes concurrently.
+type sessionAckState struct {
+	mu             sync.Mutex
+	supported      bool // a server-assigned epoch was learned
+	epoch          uint64
+	sent           uint64 // R: non-marker input bytes sent this epoch
+	discarded      uint64 // D: discarded non-marker input bytes this epoch
+	lastAckEpoch   uint64
+	lastAckApplied uint64
+	desynced       bool
+}
+
+func (a *sessionAckState) countSent(n uint64) {
+	a.mu.Lock()
+	a.sent += n
+	a.mu.Unlock()
+}
+
+// adoptBoundary resets R/D, adopts the server-assigned epoch and ends
+// desync. Only a MATCHED boundary may call this: a session-start/attach
+// success response carrying an epoch, or a kind=inputBoundary report. The
+// client never resets R/D locally (R7-B4 - a client-local reset on a mere
+// transport reconnect can false-confirm).
+func (a *sessionAckState) adoptBoundary(epoch uint64) {
+	a.mu.Lock()
+	a.supported, a.epoch = true, epoch
+	a.sent, a.discarded = 0, 0
+	a.lastAckEpoch, a.lastAckApplied = 0, 0
+	a.desynced = false
+	a.mu.Unlock()
+}
+
+// addDiscarded applies a kind=inputDiscardCompleted report: only
+// same-epoch D updates count; stale-epoch updates are ignored entirely
+// (R7-B4) - they surface through OnInputReport for transparency only.
+func (a *sessionAckState) addDiscarded(epoch, n uint64) {
+	a.mu.Lock()
+	if a.supported && epoch == a.epoch {
+		a.discarded += n
+	}
+	a.mu.Unlock()
+}
+
+// observeAck applies one input_ack: a same-epoch ack advances the applied
+// frontier; any other epoch sets desync (the client NEVER rebases - an
+// ack reports applied-at-generation-time and cannot map outstanding sent
+// bytes) and stops confirming anything until the next matched boundary.
+func (a *sessionAckState) observeAck(epoch, applied uint64) {
+	a.mu.Lock()
+	if a.supported {
+		if epoch == a.epoch {
+			if applied >= a.lastAckApplied {
+				a.lastAckEpoch, a.lastAckApplied = epoch, applied
+			}
+		} else {
+			a.desynced = true
+		}
+	}
+	a.mu.Unlock()
+}
+
+// snapshot captures the coverage coordinates for a control being sent now.
+func (a *sessionAckState) snapshot() InputAckSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return InputAckSnapshot{Supported: a.supported, Epoch: a.epoch, Offset: a.sent}
+}
+
+// delivered evaluates the coverage rule for a snapshot: delivered iff the
+// feature is active on both ends, the snapshot's epoch is still current,
+// no desync is pending, and the newest same-epoch ack covers the offset
+// minus this epoch's discarded bytes (appliedBytes >= R - D, evaluated in
+// the overflow-safe form appliedBytes + D >= R).
+func (a *sessionAckState) delivered(snap InputAckSnapshot) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.supported || !snap.Supported || a.desynced {
+		return false
+	}
+	if snap.Epoch != a.epoch || a.lastAckEpoch != a.epoch {
+		return false
+	}
+	return a.lastAckApplied+a.discarded >= snap.Offset
 }
 
 // SshUdpSession represents a connection to a remote command or shell
@@ -1050,6 +1279,8 @@ type SshUdpSession struct {
 	inputMarker  atomic.Pointer[[]byte]
 	outForwarder *clientOutputForwarder
 	errForwarder *clientOutputForwarder
+	// ackState is this session's input-ack coordinate state (tsshd#7).
+	ackState sessionAckState
 }
 
 // Wait waits for the remote command to exit
@@ -1177,8 +1408,17 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 	if err := sendMessage(s.stream, msg); err != nil {
 		return fmt.Errorf("send session message failed: %w", err)
 	}
-	if err := recvError(s.stream); err != nil {
+	var resp startResponse
+	if err := recvResponse(s.stream, &resp); err != nil {
 		return err
+	}
+	// The eager epoch channel (tsshd#7): a nonzero epoch means the server
+	// carries the input-ack feature; adopting it here is the matched input
+	// boundary at the input origin (both sides reset together, R7-B4). A
+	// zero epoch (old server) leaves the session's ack state unsupported -
+	// nothing ever confirms, zero behavioral difference.
+	if resp.Epoch > 0 && s.client.inputAckEnabled.Load() {
+		s.ackState.adoptBoundary(resp.Epoch)
 	}
 	if s.stdin != nil {
 		go s.forwardInput()
@@ -1236,6 +1476,14 @@ func (s *SshUdpSession) forwardInput() {
 			if err := writeAll(s.stream, buf); err != nil {
 				return
 			}
+			// R (tsshd#7): count the non-marker bytes actually handed to the
+			// transport, in the epoch current at write completion - a
+			// boundary report processed meanwhile resets the counter, so a
+			// pre-injection write racing the report over-counts R (which
+			// only ever delays a confirmation, never fabricates one). The
+			// marker bytes above are deliberately not counted: client
+			// offsets and server counters live in one non-marker domain.
+			s.ackState.countSent(uint64(len(buf)))
 		}
 		if err != nil {
 			return
@@ -1469,6 +1717,24 @@ func (s *SshUdpSession) GetExitCode() int {
 // GetID returns the unique session ID
 func (s *SshUdpSession) GetID() uint64 {
 	return s.id
+}
+
+// InputAckSnapshot captures this session's current input-coverage
+// coordinates (tsshd#7): call it at the moment a control (e.g. a Ctrl-C)
+// is sent and evaluate the returned snapshot with InputDelivered. The
+// snapshot's epoch is checked at delivery time, so a control sent in a
+// superseded epoch never confirms.
+func (s *SshUdpSession) InputAckSnapshot() InputAckSnapshot {
+	return s.ackState.snapshot()
+}
+
+// InputDelivered evaluates the coverage rule for a snapshot: true iff the
+// input-ack feature is active on both ends, the snapshot's epoch is still
+// current, no desync is pending, and the newest same-epoch ack covers the
+// snapshot's offset minus this epoch's discarded bytes
+// (appliedBytes >= R - D).
+func (s *SshUdpSession) InputDelivered(snap InputAckSnapshot) bool {
+	return s.ackState.delivered(snap)
 }
 
 // Attach attaches to an existing session with the given ID
