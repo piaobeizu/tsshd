@@ -282,6 +282,8 @@ The following clients or terminals support the `tsshd` server:
 
 - If `$XDG_CONFIG_HOME/tsshd/sshd_config` exists (default `~/.config/tsshd/sshd_config`), tsshd prefers it over the OpenSSH config, even if it is empty.
 
+- `KcpWireRate <bytes/s>` (KCP only): paces the server's session output below a downlink wire budget in bytes/s. `--kcp-wire-rate <bytes/s>` sets the same knob on the command line and wins over the config file; `0` (the default) disables pacing. The budget counts everything that reaches the wire for session output — FEC 1+1 parity packets (every datagram is doubled), transport framing, and loss-retransmissions — so the payload token rate granted to PTY output is `budget / 2.6` bytes/s. Recommended recipe: `~0.7 × the bottleneck link's rate` (e.g. `175000` for a 2 Mbps bottleneck), which keeps the bottleneck queue out of saturation so control input and uplink ACKs get through while output floods; without it, an output flood over a weak link buries Ctrl-C confirmations behind a multi-second in-flight backlog (see `benchmarks/control-latency/README.md`). One budget is shared by every session stdout/stderr stream on the same KCP connection; port-forward and datagram streams are not paced (v1 limitation). Ignored with a warning when tsshd is not started with `--kcp`.
+
 #### Client Configuration (tssh)
 
 ```

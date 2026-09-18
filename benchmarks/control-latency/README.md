@@ -179,6 +179,95 @@ tc qdisc add dev veth-client root handle 1: netem delay 50ms loss 20% rate 250kb
 # split (per direction): same command on both veth ends
 ```
 
+## P1 output pacing (tsshd#6): the p1_* variants
+
+The server now ships a default-off, per-KCP-connection output pacer
+(`--kcp-wire-rate <bytes/s>` / sshd_config `KcpWireRate`; see `tsshd/output.go`).
+The `p1_*` case variants run the same cases with the pacer at the recipe:
+`0.7 x bottleneck` wire budget — 175,000 B/s at the 2 Mbps reference — with
+the payload token rate = wire budget / 2.6 (amp tightened 2.2 -> 2.6 with
+campaign evidence; see below). The clean-link regression uses the design's
+separately-configured 200 Mbps cap (25,000,000 B/s) on the 100 Mbps case,
+never the weak-link recipe. Uncapped clean/loss cases run the weak-link
+recipe so the pacer is the binding downlink constraint even on a clean link.
+
+**Measured (2026-09-18, same-pin before/after campaign; `results/p1-*.json`
+vs `results/p1off-*.json`, 3 seeded runs each):**
+
+| budget | P1-off (before) | P1-on @ recipe (after) | gate |
+|---|---|---|---|
+| row 1 input p95 (8 cases) | committed envelopes + same-pin re-measure | 51-215 ms on the 7 non-paste cases (bottleneck envelopes were 2767-5320 ms); paste 4.7-5.0 s, inside its 6.9 s envelope | **3/3 PASS** every case |
+| row 2 confirmation p95 | honest full-coverage accounting (24-30 of 30 markers): shared 10.9-13.2 s, split 8.7-9.4 s | prefix p95 shared 5.7-7.1 s, split 3.6-4.3 s; only 5-15 of 30 markers arrive within the 120 s marker drain | **FAIL 3/3**: over the 1.5 s design target AND not citable (truncated marker prefix; ~2x improvement on the comparable prefix; remainder owned by tsshd#13 — see below) |
+| row 5 degraded goodput | collapsed: same-pin medians shared 10.7 KB/s, split 38.5 KB/s (committed 14.7/66.8 KB/s) | shared 551-577 kbps; split 531-537 kbps | shared **3/3 PASS** (formula floor 53846 B/s + 2x unpaced); split passes formula + committed parity 63427 B/s (2x unreachable by construction, see the row-5-p1 contract) |
+| row 5 clean capped | same-pin median 1.18 MB/s (`p1off-bulk-clean-cap200.json`) | 1.19-1.27 MB/s | **3/3 PASS** (>= 90% of same-pin P1-off median) |
+| row 5 matched-stimulus attribution | p1offq references (same 8 KB/s uplink, pacing off): shared 29.8-55.1 KB/s (median 53.2), split 23.2-107.7 KB/s (median 93.0; retransmit-luck spread) | shared 68.8-72.1 KB/s (1.29x the matched median); split capped at the recipe | controlled attribution: shared improves under pacing; split is deliberately capped by the weak-link recipe (its per-direction queue has no downlink/uplink contention) - the honest cost, recorded in budget-baselines.json |
+| row 6 amplification | clean ~2.68x one-way; degraded 4.1-8.7x | one-way `p1_baseline` 2.29-2.31x; degraded bulk 2.34-2.60x | **3/3 PASS** (<= 2.8x one-way, <= 4.0x degraded) |
+| row 7 reconnect | same-pin maxima 1140.4/1015.7 ms (committed 976.3/921.2); attach gap 30720 B committed, 0 expected now | roam reattach 736.5-941.7 ms; attach 819.8-921.8 ms; continuity gap **0** (tsshd#11 landed) | **3/3 PASS** (same-pin suite max +10%, the committed row-7 convention) |
+| row 8 integrity | diff 0 | diff **0** under pacing (clean + flood) | **3/3 PASS** |
+| paste censors | red truncated/censored runs on the deep tail | **zero censored samples, 3/3 green** | as the row-1 contract predicted |
+
+**Row 2 analysis (why 1.5 s is not reached, and why the P1-on side is not
+citable; honest full-marker accounting, evidence on the tsshd#6 timeline,
+remainder owned by tsshd#13):** the original harness computed confirmation
+p95 over a truncated marker prefix (the `markerCount()` scan-tail bug) and
+understated the tail; with cumulative marker counting, a bounded 120 s
+full-marker drain and a citability gate, the two pacing regimes fail
+differently. UNPACED, the shared queue pins, the flooding child blocks hard,
+the backlog stops growing and drains completely — 24-30 of 30 markers arrive
+within the bounded drain, at p95 10.9-13.2 s (shared) and 8.7-9.4 s (split).
+PACED, the queue never pins, so the child keeps flooding for the whole run:
+delivery tracks ~0.8x the offered payload at 20% bidirectional loss (the
+design's own 0.8 efficiency factor) and the deficit accumulates in the kcp
+send queue; the stream-ordered marker sits behind it, the received-prefix
+lags plateau at ~4-4.6 s, and once the paced stream thins to a sparse tail,
+loss recovery degrades to kcp RTO backoff (~4 KB/s measured post-flood stall)
+so only 5-15 of 30 markers arrive within the 120 s drain. The child itself
+writes every marker within ~1.2 s (`marker_write_ms` in every count-mode
+artifact), so the child-side fd starvation is real but is not the tail
+driver. The prefix p95 already exceeds the 1.5 s target 2.4-4.7x, so the
+verdict does not hinge on the missing tail; the citability gate fails the
+runs independently, honestly. The deficit is proportional to the offer
+(measured at amp 2.2, 2.6 and 3.4), so tightening the amp further does not
+close the gap. Pacing still buys the full input-latency win (row 1), kills
+the queue pinning (maxq ~30 vs 1000), drops wire amplification to
+~2.0-2.8x, and roughly halves confirmation latency on the comparable prefix
+(11.9 s -> 5.7 s shared, 8.7 s -> 3.8 s split). Closing the remainder needs
+kcp-level loss-recovery work (hole recovery under sparse tails), explicitly
+out of tsshd#6's non-goals — filed as **tsshd#13**; the 1.5 s gate stays
+enforced, never relaxed.
+
+**Amp tightening evidence (2.2 -> 2.6):** at 2.2 the recipe's 175 KB/s wire
+budget was itself oversubscribed — the downlink's retransmit overhead at 20%
+loss pushed actual wire usage to ~2.5x payload, the shared queue re-pinned
+(maxq 1000, ~5.7 MB tail-dropped) and degraded goodput collapsed to ~20 KB/s.
+At 2.6 the offered wire stays inside the budget including retransmissions.
+
+**Bounded uplink source in the degraded bulk cases (both pacing configurations):**
+the p1 and p1offq degraded bulk variants bound the client's uplink source to
+8 KB/s (~3x the canonical-PTY line-discipline drain the harness itself
+measured: uplink delivered 0.3-0.8 KB/s in every committed bulk run). The
+historical 800 KB/s firehose exists to stress the unpaced collapse; against
+a paced downlink it fabricates an uplink-side collapse (the client's kcp
+send queue absorbs ~2 MB and retransmits it into the shared queue for the
+whole run — 5.7-10.8 MB offered uplink for ~70 KB of payload, in both paced
+and committed unpaced runs). No real agent session pushes input faster than
+its PTY consumes; the row-5 pinned-formula gate tests the downlink recipe
+and requires the downlink to actually receive its budgeted share. The
+before/after comparison is controlled (review finding): the `p1offq_*`
+reference suites run the same degraded bulk cases with the SAME 8 KB/s
+uplink and pacing OFF, while the 800 KB/s firehose P1-off re-measures stay
+committed separately as the alternate workload
+(`results/p1off-bulk_bottleneck_*.json`). The row-5-p1 gate keeps binding
+to the committed/original-stimulus references per the wi's own wording; the
+p1offq artifacts carry the controlled attribution reported in the campaign
+summary.
+
+**Regenerating the campaign summary:** the `tsshd6_campaign` section of
+`results/budget-baselines.json` is GENERATED from the result artifacts by
+`gen_campaign_summary.py` (invoked at the end of `run_campaign.sh`, or
+`./run_campaign.sh gen` alone) — summary numbers are never hand-typed
+(review finding: hand-typed prose had drifted from the artifacts).
+
 ## Measured results (committed artifacts, 2026-09-16, loopback host)
 
 | case | Ctrl-C → SIGINT | child react | marker travel | perceived total | verdict |

@@ -78,6 +78,13 @@ type sshUdpServer struct {
 	udpFwdSessionMap     map[string]*udpForwardSession
 	udpFwdPendingMutex   sync.Mutex
 	udpFwdPendingMap     map[uint64]*udpForwardSession
+
+	// wirePacer paces this connection's session PTY output below the
+	// configured --kcp-wire-rate downlink wire budget (nil when pacing is
+	// off: QUIC connections, or a zero/unset rate, the default). One server
+	// instance == one accepted KCP connection, so ONE pacer here is shared
+	// by every session stdout/stderr forwarder on that connection.
+	wirePacer *wireRatePacer
 }
 
 var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, proto protocolServer) streamHandler {
@@ -106,6 +113,16 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 
 	server := &sshUdpServer{args: args, client: client, proxy: proxy, proto: proto,
 		streamMap: make(map[uint64]Stream),
+	}
+	if args.KCP {
+		// One pacer per accepted KCP connection. Created here (the per-connection
+		// constructor) from args that flowed main.go:parseTsshdArgs -> initServer ->
+		// serveKCP -> handleKcpConn -> here; nil unless a positive rate was set.
+		server.wirePacer = newWireRatePacer(args.KcpWireRate)
+		if server.wirePacer != nil {
+			debug("kcp wire rate pacing enabled for client [%x]: wire budget %d B/s, payload ~%.0f B/s",
+				server.client.proxyAddr.clientID, args.KcpWireRate, float64(args.KcpWireRate)/kWireAmpEstimate)
+		}
 	}
 
 	go func() {

@@ -296,6 +296,25 @@ func (c *sessionContext) isKeepPendingOutput() bool {
 	return false
 }
 
+// wirePacer returns the output pacer of the connection the session is
+// CURRENTLY attached to (nil while detached, on QUIC connections, or when
+// --kcp-wire-rate is 0 / unset, the default). serverOutputForwarder calls
+// this once per chunk in writerLoop, ahead of the smux write, so the session's
+// stdout/stderr output is offered to the transport at no more than the
+// connection's configured downlink wire budget. The dynamic lookup is what
+// keeps the ONE bucket per KCP connection invariant under reattach: a
+// session migrated to a new connection immediately follows the new
+// connection's budget instead of its old one. One chunk already inside
+// wait() when the session detaches finishes its sleep against the old
+// connection's bucket and then writes through the newly swapped stream -
+// bounded to a single in-flight chunk by the writeBufCh capacity of one.
+func (c *sessionContext) wirePacer() *wireRatePacer {
+	if server := c.server.Load(); server != nil {
+		return server.wirePacer
+	}
+	return nil
+}
+
 func (c *sessionContext) newOutputForwarder(name string, reader io.Reader, stream Stream) *serverOutputForwarder {
 	return &serverOutputForwarder{
 		name:       name,

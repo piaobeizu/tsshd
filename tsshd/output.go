@@ -232,9 +232,184 @@ func (f *serverOutputForwarder) enqueueWhileDisconnected(buf []byte) bool {
 	}
 }
 
+// kWireAmpEstimate is the wire-amplification estimate that converts a downlink
+// WIRE budget (bytes/s on the physical link, FEC parity packets and transport
+// framing included) into the payload token rate the pacer grants to PTY
+// output before it enters the smux stream:
+//
+//	payload rate = wire budget / kWireAmpEstimate
+//
+// Composition: the FEC 1+1 floor of 2.0 (every datagram is doubled: one data
+// shard plus one parity shard, including kcp ACK packets), times framing
+// (~1.04: smux+kcp headers against ~1.4 KB packets), times the loss-recovery
+// retransmission factor (~1.25 at the 20%-loss reference: each segment needs
+// ~1/0.8 sends on average). 2.6 is the evidence-backed tightening of the
+// design's initial 2.2: measured 2026-09-18 on the tsshd#6 harness at the
+// 2 Mbps + 20% loss reference (results/p1off-* and the campaign artifacts):
+// at 2.2 the recipe's 175 KB/s wire budget was itself oversubscribed - the
+// downlink's retransmit overhead pushed actual wire usage to ~2.5x payload,
+// the shared queue re-pinned (maxq 1000, ~5.7 MB tail-dropped) and the
+// downlink goodput collapsed to ~20 KB/s; at 2.6 the offered wire stays
+// inside the budget including retransmissions. The value may only be
+// re-tightened (never loosened) with new measured amplification evidence,
+// and any change must recompute the row-5 gate by its pinned formula
+// (delivered >= 0.8 x (1.4 Mbps / amp); see docs/weak-network-agent-design.md
+// section 7) and be recorded on the work item timeline.
+const kWireAmpEstimate = 2.6
+
+// kPacerTokenInterval is the pacer's token interval. The bucket's burst
+// capacity is exactly one token interval's worth of payload tokens
+// (rate x interval), so the pacer never lets a burst run more than one
+// token interval ahead of the configured wire budget.
+const kPacerTokenInterval = 100 * time.Millisecond
+
+// kPacerMaxSleep bounds each individual wait() sleep. The deficit is paid in
+// slices of at most this length, so wait() re-evaluates at least once a second
+// and an erroneously long single sleep can never be scheduled; the TOTAL
+// retention of a closing connection's writer goroutine (server shutdown waits
+// on the writer through forward's <-done) remains the full deficit payoff,
+// n_deficit / payload_rate: sub-second at the documented recipe (a 32 KiB
+// chunk at 175,000 B/s wire / 2.6 ~= 0.48 s), ~21 s per 32 KiB chunk at the
+// kMinKcpWireRate warning floor, and unbounded below it - which is why the
+// floor produces a startup warning rather than a silent clamp.
+const kPacerMaxSleep = time.Second
+
+// wireRatePacer is a token bucket that paces one KCP connection's session
+// PTY output (stdout and stderr of every session on that connection) before
+// it enters the smux stream, keeping the offered wire rate under a configured
+// downlink WIRE budget so a weak-link bottleneck queue stays out of
+// saturation. That headroom is what lets small control packets and the
+// uplink kcp ACKs regain medium time (the tsshd#1/tsshd#3 measured failure
+// mode: an unpaced flood pins the bottleneck queue, and the confirmation
+// marker is buried behind a multi-second in-flight backlog).
+//
+// Exactly ONE pacer exists per KCP connection, owned by that connection's
+// sshUdpServer and shared by all of its session forwarders; independent
+// per-forwarder buckets could collectively exceed the wire budget. Forwarders
+// look the pacer up through their session's CURRENT server so a session that
+// reattaches to a new connection follows the new connection's pacer.
+//
+// The budget clock is anchored to the monotonic clock on FIRST USE, not at
+// construction: construction time and first-use time can be arbitrarily far
+// apart (a server may accept its first session minutes later), and a
+// construction-anchored bucket silently grants a huge burst of stale tokens
+// (the tsshd#1 measured pitfall).
+//
+// A nil *wireRatePacer means pacing is disabled (--kcp-wire-rate 0, the
+// default): every method is a no-op and writerLoop never touches a lock, so
+// the default configuration is byte-for-byte the unpaced code path.
+type wireRatePacer struct {
+	mu sync.Mutex
+
+	// rate is the payload token rate in bytes/s: wire budget / amp estimate.
+	rate float64
+
+	// burst is the bucket capacity: one token interval's worth of tokens.
+	// A write may spend at most this many accrued tokens immediately; any
+	// excess waits for tokens to accrue. Bounded burst <= one token interval.
+	burst float64
+
+	// tok is the currently accrued token balance. It starts at burst on
+	// first use (one interval of headroom, so an interactive-sized first
+	// write is not delayed behind an empty bucket) and never exceeds burst.
+	tok float64
+
+	// last is the monotonic time of the last refill; the zero value means
+	// "never used" and anchors the clock on the first wait call.
+	last time.Time
+}
+
+// newWireRatePacer builds a pacer for a downlink wire budget in bytes/s.
+// wireRateBPS <= 0 returns nil: the knob is off and pacing is disabled.
+func newWireRatePacer(wireRateBPS uint64) *wireRatePacer {
+	if wireRateBPS == 0 {
+		return nil
+	}
+	rate := float64(wireRateBPS) / kWireAmpEstimate
+	return &wireRatePacer{
+		rate:  rate,
+		burst: rate * kPacerTokenInterval.Seconds(),
+	}
+}
+
+// wait blocks until n payload bytes may be handed to the smux stream.
+//
+// The bucket works as bounded credit + serialized debt: accrued credit is
+// capped at one token interval's worth (the burst), but a single take may
+// exceed the accrued credit — it goes into debt for the difference and
+// sleeps the debt off at the payload rate. Sleeping happens UNDER the pacer
+// mutex, on purpose. This pacer is the shared budget for the whole
+// connection: if two forwarders each slept their own deficit outside the
+// lock, both would wake at the same instant and collectively overshoot the
+// wire budget. Holding the lock across the sleep makes the debt itself
+// serial: a second forwarder queues behind the first one's paced write.
+// In any window the bytes released to the transport never exceed
+// burst + rate x window, so the offered wire rate stays under the budget
+// while an interactive-sized write (<= burst) is never delayed behind an
+// empty bucket. Writes are chunk-granular (writeBufCh holds one buffer, at
+// most the 32 KB read chunk), so at the weak-link recipe the longest single
+// sleep is sub-second, and the pacing chain (writerLoop -> writeBufCh ->
+// handleBuffer spin -> PTY kernel buffer -> child write) is exactly the
+// intended backpressure: the flooding child blocks at the source instead of
+// the server flooding the transport faster than the link can drain it.
+func (p *wireRatePacer) wait(n int) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if p.last.IsZero() {
+		// First use: anchor the clock here and grant exactly one token
+		// interval of burst credit - not the whole interval since
+		// construction (see the type comment).
+		p.last = now
+		p.tok = p.burst
+	} else {
+		// Accrued credit is capped at one token interval of burst; debt
+		// (tok < 0) is never reached here because every wait sleeps its
+		// own deficit off before returning.
+		p.tok += now.Sub(p.last).Seconds() * p.rate
+		if p.tok > p.burst {
+			p.tok = p.burst
+		}
+	}
+	p.last = now
+	p.tok -= float64(n)
+	// Anything smaller than half a byte of deficit is float rounding noise
+	// (-1e-13 etc.), not debt: without this floor the residue re-enters the
+	// loop with a zero-length sleep and spins forever (caught by the pacer
+	// unit tests when the sliced sleep was introduced).
+	for p.tok < -0.5 {
+		// The deficit sleep pays the debt at the payload rate, in slices of
+		// at most kPacerMaxSleep (see that constant for the retention
+		// trade-off at sub-recipe rates). time.Sleep never wakes early;
+		// any timer overshoot is discarded, never lent as extra credit.
+		deficit := -p.tok
+		sleep := time.Duration(deficit / p.rate * float64(time.Second))
+		if sleep > kPacerMaxSleep {
+			sleep = kPacerMaxSleep
+		}
+		time.Sleep(sleep)
+		paid := sleep.Seconds() * p.rate
+		p.tok += min(paid, deficit)
+		p.last = time.Now()
+	}
+	if p.tok < 0 {
+		p.tok = 0
+	}
+}
+
 func (f *serverOutputForwarder) writerLoop() {
 	defer func() { _ = f.stream.CloseWrite(); close(f.done) }()
 	for buf := range f.writeBufCh {
+		// Pace the offered payload BEFORE the smux write: bytes already inside
+		// kcp's send queue cannot be evicted without corrupting smux framing, so
+		// prevention has to happen ahead of the transport. The lookup goes
+		// through the session's CURRENT server (nil while detached, QUIC servers
+		// and the 0-rate default carry no pacer), so reattached sessions follow
+		// the new connection's budget.
+		f.sess.wirePacer().wait(len(buf))
 		if err := writeAll(f.stream, buf); err != nil {
 			f.writeError.Store(true)
 			warning("write to [%s] failed: %v", f.name, err)
