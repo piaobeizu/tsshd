@@ -40,6 +40,7 @@ import (
 )
 
 type mockStream struct {
+	mu    sync.Mutex
 	buf   bytes.Buffer
 	err   error
 	first bool
@@ -54,6 +55,8 @@ func (s *mockStream) Read(b []byte) (n int, err error) {
 }
 
 func (s *mockStream) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.first {
 		time.Sleep(10 * time.Millisecond)
 		s.first = false
@@ -62,6 +65,12 @@ func (s *mockStream) Write(p []byte) (int, error) {
 		return 0, s.err
 	}
 	return s.buf.Write(p)
+}
+
+func (s *mockStream) setError(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
 }
 
 func (s *mockStream) Close() error {
@@ -97,6 +106,8 @@ func (s *mockStream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *mockStream) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.buf.String()
 }
 
@@ -185,6 +196,139 @@ func runForwardOutputAndReconnect(s *sessionContext, reader *chunkReader, stream
 	wg.Wait()
 }
 
+type notifyingChunkReader struct {
+	chunks [][]byte
+	read   chan int
+	index  int
+}
+
+func (r *notifyingChunkReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	r.read <- r.index
+	return n, nil
+}
+
+type blockedOutputStream struct {
+	*mockStream
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockedOutputStream) Write(p []byte) (int, error) {
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return s.mockStream.Write(p)
+}
+
+// A full transport queue must not prevent reconnect handling from acquiring
+// the output forwarder's state lock. The stream remains blocked until after
+// the callback has returned, so this is independent of network scheduling.
+func TestForwardOutput_ReconnectWhileTransportWriteBlocked(t *testing.T) {
+	sess, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+
+	stream := &blockedOutputStream{
+		mockStream: newMockStream(),
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	reader := &notifyingChunkReader{
+		chunks: [][]byte{[]byte("A\n"), []byte("B\n"), []byte("C\n")},
+		read:   make(chan int, 3),
+	}
+	forwarder := sess.newOutputForwarder("stdout", reader, stream)
+	forwardDone := make(chan struct{})
+	go func() {
+		forwarder.forward()
+		close(forwardDone)
+	}()
+	defer func() {
+		close(stream.release)
+		select {
+		case <-forwardDone:
+		case <-time.After(2 * time.Second):
+			t.Error("forwarder did not finish after releasing the stream")
+		}
+		assert.Equal(t, "A\nB\nC\n", stream.String())
+	}()
+
+	select {
+	case <-stream.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not enter the blocked stream")
+	}
+	for want := 1; want <= 3; want++ {
+		select {
+		case got := <-reader.read:
+			require.Equal(t, want, got)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("reader did not deliver chunk %d", want)
+		}
+	}
+	// After C has been handed to forward(), processing=true together with a
+	// full channel proves handleBuffer is in the blocked send branch. This is
+	// a state assertion, not a timing sleep.
+	require.Eventually(t, func() bool {
+		forwarder.handleMutex.Lock()
+		defer forwarder.handleMutex.Unlock()
+		return forwarder.processing && len(forwarder.writeBufCh) == cap(forwarder.writeBufCh)
+	}, time.Second, time.Millisecond)
+
+	callbackDone := make(chan struct{})
+	go func() {
+		forwarder.onReconnected()
+		close(callbackDone)
+	}()
+	select {
+	case <-callbackDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("reconnect callback blocked behind transport write")
+	}
+}
+
+func TestForwardOutput_PendingReconnectFlushesCache(t *testing.T) {
+	sess, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+
+	stream := newMockStream()
+	f := sess.newOutputForwarder("stdout", &chunkReader{}, stream)
+	go f.writerLoop()
+
+	f.beginProcessing()
+	f.cacheLines = [][]byte{[]byte("cached\n")}
+	// Simulate a handler waiting for transport capacity while retaining the
+	// processing token but releasing the state mutex.
+	f.handleMutex.Unlock()
+	callbackDone := make(chan struct{})
+	go func() {
+		f.onReconnected()
+		close(callbackDone)
+	}()
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		f.handleMutex.Lock()
+		f.endProcessing()
+		t.Fatal("reconnect callback waited for the processing owner")
+	}
+	f.handleMutex.Lock()
+	f.endProcessing()
+	close(f.writeBufCh)
+	select {
+	case <-f.done:
+	case <-time.After(time.Second):
+		t.Fatal("cached output did not drain")
+	}
+	assert.Equal(t, "cached\n", stream.String())
+}
+
 func TestForwardOutput_Normal(t *testing.T) {
 	assert := assert.New(t)
 	s, reset := newTestSessionContext(false, false, 10)
@@ -221,7 +365,7 @@ func TestForwardOutput_WriteError(t *testing.T) {
 	defer reset()
 
 	stream := newMockStream()
-	stream.err = errors.New("mock write error")
+	stream.setError(errors.New("mock write error"))
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\n")}, chunk: 1}
 
 	s.newOutputForwarder("stdout", reader, stream).forward()
@@ -318,7 +462,7 @@ func TestForwardOutput_FlushWriteError(t *testing.T) {
 	}
 
 	runForwardOutputAndReconnect(s, reader, stream, func() {
-		stream.err = errors.New("mock write error")
+		stream.setError(errors.New("mock write error"))
 		close(signal)
 	})
 
@@ -574,8 +718,10 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 		chunk:  1,
 	}
 
+	done := make(chan struct{})
 	go func() {
 		runForwardOutputAndReconnect(s, reader, stream, nil)
+		close(done)
 	}()
 
 	assert.Eventually(func() bool {
@@ -583,6 +729,11 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	close(block)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not finish after releasing the reader")
+	}
 }
 
 func TestForwardOutput_TimeoutWithoutNewLine(t *testing.T) {
